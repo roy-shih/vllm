@@ -189,15 +189,20 @@ class PEARLProposer:
         """
         Generate draft tokens using the draft model.
 
-        TODO: This is a placeholder implementation that needs to be replaced
-        with proper draft model inference. For now, it returns empty list
-        to avoid errors.
+        This is a simplified auto-regressive implementation that generates
+        tokens one at a time using greedy sampling.
 
-        In the full implementation, this should:
-        1. Use the draft model to generate tokens auto-regressively
-        2. Implement PEARL's adaptive draft length
-        3. Use proper KV cache management
-        4. Integrate with vLLM's attention backends
+        Limitations of current implementation:
+        - No KV cache (inefficient, recomputes every time)
+        - No batching (processes one sequence at a time)
+        - Greedy sampling only (no temperature/top-p)
+        - No attention metadata optimization
+
+        Future improvements needed:
+        - Implement KV cache for efficiency
+        - Add batched inference
+        - Implement PEARL's adaptive draft length
+        - Optimize with attention backends
 
         Args:
             token_ids: Input token IDs
@@ -206,18 +211,86 @@ class PEARLProposer:
         Returns:
             List of draft token IDs
         """
-        # TODO: Implement proper draft token generation
-        # For now, return empty list so the system works without errors
-        # This means no speculative decoding happens yet, but the pipeline
-        # is exercised and MAT logging will show 0 acceptance (which is correct)
+        if self.draft_model is None:
+            logger.warning("[PEARL] Draft model not initialized")
+            return []
+
+        if not token_ids:
+            logger.warning("[PEARL] Empty token_ids provided")
+            return []
+
+        draft_tokens = []
+        current_tokens = token_ids.copy()
+
+        try:
+            # Auto-regressive generation
+            for step in range(num_draft_tokens):
+                # Prepare input tensors
+                input_ids = torch.tensor(
+                    [current_tokens],
+                    dtype=torch.long,
+                    device=self.device
+                )
+
+                seq_len = len(current_tokens)
+                positions = torch.arange(
+                    seq_len,
+                    dtype=torch.long,
+                    device=self.device
+                ).unsqueeze(0)
+
+                # Forward pass through draft model
+                # Note: This is a simplified call without proper attention metadata
+                # For production, need to integrate with vLLM's attention backends
+                try:
+                    with set_forward_context(None, self.vllm_config, num_tokens=seq_len):
+                        outputs = self.draft_model(
+                            input_ids=input_ids,
+                            positions=positions,
+                        )
+
+                    # Extract logits from outputs
+                    # The output format depends on the model architecture
+                    if hasattr(outputs, 'logits'):
+                        logits = outputs.logits
+                    elif isinstance(outputs, tuple) and len(outputs) > 0:
+                        logits = outputs[0]
+                    else:
+                        logits = outputs
+
+                    # Get logits for the last position
+                    last_token_logits = logits[0, -1, :]
+
+                    # Greedy sampling (argmax)
+                    next_token = last_token_logits.argmax(dim=-1).item()
+
+                    # Add to draft tokens
+                    draft_tokens.append(next_token)
+                    current_tokens.append(next_token)
+
+                    logger.debug(
+                        f"[PEARL] Step {step+1}/{num_draft_tokens}: "
+                        f"Generated token {next_token}"
+                    )
+
+                except Exception as e:
+                    logger.warning(
+                        f"[PEARL] Error in draft model forward pass at step {step}: {e}. "
+                        f"Returning {len(draft_tokens)} tokens generated so far."
+                    )
+                    break
+
+        except Exception as e:
+            logger.error(f"[PEARL] Error generating draft tokens: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
         logger.debug(
-            f"[PEARL] Draft token generation called for {len(token_ids)} input tokens, "
-            f"requesting {num_draft_tokens} draft tokens. "
-            "(Currently returning empty - needs implementation)"
+            f"[PEARL] Generated {len(draft_tokens)} draft tokens "
+            f"from {len(token_ids)} input tokens"
         )
 
-        return []
+        return draft_tokens
 
     def log_stats(self):
         """Log PEARL statistics."""

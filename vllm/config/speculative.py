@@ -45,6 +45,7 @@ SpeculativeMethod = Literal[
     "mlp_speculator",
     "draft_model",
     "suffix",
+    "pearl",
     EagleModelTypes,
 ]
 
@@ -145,6 +146,29 @@ class SpeculativeConfig:
     """The minimum token probability for suffix decoding. Will only speculate
     tokens with estimated probability (based on frequency counts) greater than
     or equal to this value."""
+
+    # PEARL configuration
+    pearl_gamma: int = -1
+    """The gamma parameter for PEARL (window size for adaptive draft length).
+    -1 means auto-set based on hardware configuration."""
+
+    pearl_max_num_batched_tokens: int = 16384
+    """The maximum number of batched tokens for PEARL.
+    Use 8192 for 40GB GPUs."""
+
+    pearl_max_num_seqs: int = 512
+    """The maximum number of sequences for PEARL.
+    Use 128 or 256 for 40GB GPUs."""
+
+    pearl_kvcache_block_size: int = 256
+    """The KV cache block size for PEARL."""
+
+    pearl_num_kvcache_blocks: int = -1
+    """The number of KV cache blocks for PEARL. -1 means auto-set."""
+
+    target_tensor_parallel_size: int | None = Field(default=None, ge=1)
+    """The degree of tensor parallelism for the target model in PEARL.
+    Only used when method is 'pearl'."""
 
     def compute_hash(self) -> str:
         """

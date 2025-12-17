@@ -86,10 +86,26 @@ class PEARLProposer:
         self.total_drafts = 0
         self.total_accepted = 0
 
+        # Adaptive draft length tracking (PEARL feature)
+        self.adaptive_enabled = self.gamma > 0
+        if self.adaptive_enabled:
+            # Sliding window for tracking recent acceptance
+            from collections import deque
+            self.acceptance_history = deque(maxlen=self.gamma)
+            self.min_draft_tokens = max(1, self.num_speculative_tokens // 2)
+            self.max_draft_tokens = self.num_speculative_tokens
+            self.current_draft_tokens = self.num_speculative_tokens
+            logger.info(f"[PEARL] Adaptive draft length ENABLED")
+            logger.info(f"[PEARL] Draft token range: [{self.min_draft_tokens}, {self.max_draft_tokens}]")
+        else:
+            self.acceptance_history = None
+            self.current_draft_tokens = self.num_speculative_tokens
+            logger.info(f"[PEARL] Adaptive draft length DISABLED (gamma={self.gamma})")
+
         logger.info("=" * 50)
         logger.info("[PEARL] Initializing PEARL Proposer (vLLM-integrated)")
         logger.info(f"[PEARL] Num speculative tokens: {self.num_speculative_tokens}")
-        logger.info(f"[PEARL] Gamma: {self.gamma}")
+        logger.info(f"[PEARL] Gamma (window size): {self.gamma}")
         logger.info(f"[PEARL] Max num tokens: {self.max_num_tokens}")
         logger.info(f"[PEARL] Device: {device}")
         logger.info("=" * 50)
@@ -193,32 +209,189 @@ class PEARLProposer:
 
         logger.debug(f"[PEARL] Token sequences lengths: {[len(s) for s in token_sequences]}")
 
-        # Generate draft tokens for each sequence in the batch
-        all_draft_tokens = []
+        # Use adaptive draft length if enabled
+        num_draft_to_generate = self.current_draft_tokens
 
-        for seq_idx, token_seq in enumerate(token_sequences):
-            draft_tokens = self._generate_draft_tokens_for_sequence(
-                token_ids=token_seq,
-                num_draft_tokens=self.num_speculative_tokens,
+        logger.debug(
+            f"[PEARL] Generating {num_draft_to_generate} draft tokens "
+            f"(adaptive={'ON' if self.adaptive_enabled else 'OFF'})"
+        )
+
+        # Generate draft tokens in batched mode for efficiency
+        result = self._generate_drafts_batched(
+            token_sequences=token_sequences,
+            batch_size=batch_size,
+            num_drafts=num_draft_to_generate,
+        )
+
+        logger.debug(
+            f"[PEARL] Generated draft_tokens shape: {result.shape}"
+        )
+
+        return result
+
+    def _generate_drafts_batched(
+        self,
+        token_sequences: list[list[int]],
+        batch_size: int,
+        num_drafts: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Generate draft tokens for all sequences in batch (OPTIMIZED).
+
+        This method processes all sequences together in batched forward passes,
+        which is much more efficient than processing one-by-one.
+
+        Args:
+            token_sequences: List of token sequences for each request
+            batch_size: Number of sequences
+            num_drafts: Number of draft tokens to generate (uses self.num_speculative_tokens if None)
+
+        Returns:
+            Draft tokens tensor [batch_size, num_speculative_tokens]
+        """
+        if num_drafts is None:
+            num_drafts = self.num_speculative_tokens
+
+        if not token_sequences:
+            return torch.zeros(
+                (batch_size, self.num_speculative_tokens),
+                dtype=torch.int32,
+                device=self.device,
             )
-            all_draft_tokens.append(draft_tokens)
 
-        # Convert to tensor: [batch_size, num_speculative_tokens]
+        # Initialize result tensor (always sized for max tokens, but we'll only fill num_drafts)
         result = torch.zeros(
             (batch_size, self.num_speculative_tokens),
             dtype=torch.int32,
             device=self.device,
         )
 
-        for i, draft_tokens in enumerate(all_draft_tokens):
-            num_generated = len(draft_tokens)
-            if num_generated > 0:
-                result[i, :num_generated] = torch.tensor(
-                    draft_tokens, dtype=torch.int32, device=self.device
-                )
+        # Track current sequences (we'll append draft tokens as we generate)
+        current_sequences = [seq.copy() for seq in token_sequences]
+
+        try:
+            # Generate draft tokens step by step in batched mode
+            for step in range(num_drafts):
+                logger.debug(f"[PEARL] Batched draft step {step+1}/{num_drafts}")
+
+                # Find max sequence length for padding
+                max_len = max(len(seq) for seq in current_sequences)
+
+                # Truncate sequences that are too long
+                if max_len > self.max_model_len:
+                    max_len = self.max_model_len
+                    current_sequences = [
+                        seq[-max_len:] if len(seq) > max_len else seq
+                        for seq in current_sequences
+                    ]
+
+                # Create padded batch
+                # Padding token: use 0 (will be masked by attention)
+                padded_sequences = []
+                attention_mask = []
+
+                for seq in current_sequences:
+                    seq_len = len(seq)
+                    if seq_len < max_len:
+                        # Pad on the left (more common for causal LM)
+                        padding_len = max_len - seq_len
+                        padded_seq = [0] * padding_len + seq
+                        mask = [0] * padding_len + [1] * seq_len
+                    else:
+                        padded_seq = seq[-max_len:]
+                        mask = [1] * max_len
+
+                    padded_sequences.append(padded_seq)
+                    attention_mask.append(mask)
+
+                # Convert to tensors
+                input_ids = torch.tensor(
+                    padded_sequences,
+                    dtype=torch.long,
+                    device=self.device
+                )  # [batch_size, max_len]
+
+                positions = torch.arange(
+                    max_len,
+                    dtype=torch.long,
+                    device=self.device
+                ).unsqueeze(0).expand(batch_size, -1)  # [batch_size, max_len]
+
+                # Forward pass
+                try:
+                    with set_forward_context(
+                        None,  # No per-layer metadata for simplified approach
+                        self.vllm_config,
+                        num_tokens=batch_size * max_len,
+                    ):
+                        # Flatten for model input
+                        flat_input_ids = input_ids.reshape(-1)
+                        flat_positions = positions.reshape(-1)
+
+                        outputs = self.model(
+                            input_ids=flat_input_ids,
+                            positions=flat_positions,
+                        )
+
+                    # Extract hidden states
+                    if isinstance(outputs, tuple):
+                        hidden_states = outputs[0]
+                    else:
+                        hidden_states = outputs
+
+                    # Reshape to [batch_size, max_len, hidden_size]
+                    if hidden_states.dim() == 2:
+                        # [batch_size * max_len, hidden_size]
+                        hidden_states = hidden_states.view(batch_size, max_len, -1)
+
+                    # Get last token hidden states for each sequence
+                    # For each sequence, get the last non-padding position
+                    last_hidden_states = []
+                    for i, seq in enumerate(current_sequences):
+                        actual_len = min(len(seq), max_len)
+                        # In padded_sequences, the actual sequence ends at position (max_len - 1)
+                        # if no padding, or at position (max_len - actual_len + actual_len - 1)
+                        last_pos = max_len - 1
+                        last_hidden_states.append(hidden_states[i, last_pos, :])
+
+                    last_hidden_states = torch.stack(last_hidden_states)  # [batch_size, hidden_size]
+
+                    # Compute logits
+                    logits = self.model.compute_logits(last_hidden_states)  # [batch_size, vocab_size]
+
+                    # Greedy sampling
+                    next_tokens = logits.argmax(dim=-1)  # [batch_size]
+
+                    # Store draft tokens
+                    result[:, step] = next_tokens.to(torch.int32)
+
+                    # Update current sequences for next step
+                    for i, token in enumerate(next_tokens):
+                        current_sequences[i].append(token.item())
+
+                    logger.debug(
+                        f"[PEARL] Step {step+1}: Generated {batch_size} tokens, "
+                        f"max_len={max_len}"
+                    )
+
+                except Exception as e:
+                    logger.warning(
+                        f"[PEARL] Error in batched forward pass at step {step}: {e}. "
+                        f"Returning {step} complete draft tokens."
+                    )
+                    import traceback
+                    logger.debug(f"[PEARL] Traceback: {traceback.format_exc()}")
+                    # Partial results already stored in result tensor
+                    break
+
+        except Exception as e:
+            logger.error(f"[PEARL] Error in batched draft generation: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
         logger.debug(
-            f"[PEARL] Generated draft_tokens shape: {result.shape}"
+            f"[PEARL] Batched generation complete: {result.shape}"
         )
 
         return result
@@ -337,6 +510,65 @@ class PEARLProposer:
 
         return draft_tokens
 
+    def update_acceptance_stats(self, num_accepted_tokens: int, num_draft_tokens: int):
+        """
+        Update acceptance statistics and adjust draft length (PEARL adaptive feature).
+
+        Args:
+            num_accepted_tokens: Number of draft tokens that were accepted
+            num_draft_tokens: Total number of draft tokens proposed
+        """
+        self.total_drafts += num_draft_tokens
+        self.total_accepted += num_accepted_tokens
+
+        if self.adaptive_enabled and self.acceptance_history is not None:
+            # Track acceptance rate for this iteration
+            acceptance_rate = num_accepted_tokens / max(num_draft_tokens, 1)
+            self.acceptance_history.append(acceptance_rate)
+
+            # Adjust draft length based on recent history
+            if len(self.acceptance_history) >= self.gamma // 2:  # Have enough samples
+                self._adjust_draft_length()
+
+    def _adjust_draft_length(self):
+        """
+        Adjust the number of draft tokens based on recent acceptance rates.
+
+        PEARL's key insight:
+        - High acceptance rate → generate more draft tokens
+        - Low acceptance rate → generate fewer draft tokens (avoid waste)
+        """
+        if not self.acceptance_history:
+            return
+
+        # Calculate average acceptance rate over recent window
+        recent_acceptance_rate = sum(self.acceptance_history) / len(self.acceptance_history)
+
+        # Thresholds for adjustment
+        HIGH_ACCEPTANCE_THRESHOLD = 0.7  # If >70% accepted, increase drafts
+        LOW_ACCEPTANCE_THRESHOLD = 0.3   # If <30% accepted, decrease drafts
+
+        old_draft_tokens = self.current_draft_tokens
+
+        if recent_acceptance_rate > HIGH_ACCEPTANCE_THRESHOLD:
+            # Good alignment - increase draft tokens
+            self.current_draft_tokens = min(
+                self.max_draft_tokens,
+                self.current_draft_tokens + 1
+            )
+        elif recent_acceptance_rate < LOW_ACCEPTANCE_THRESHOLD:
+            # Poor alignment - decrease draft tokens
+            self.current_draft_tokens = max(
+                self.min_draft_tokens,
+                self.current_draft_tokens - 1
+            )
+
+        if old_draft_tokens != self.current_draft_tokens:
+            logger.info(
+                f"[PEARL] Adaptive adjustment: {old_draft_tokens} → {self.current_draft_tokens} "
+                f"(recent acceptance rate: {recent_acceptance_rate:.2%})"
+            )
+
     def log_stats(self):
         """Log statistics."""
         if self.total_drafts > 0:
@@ -344,6 +576,13 @@ class PEARLProposer:
             logger.info(
                 f"[PEARL] MAT: {mat:.2f} "
                 f"(Accepted: {self.total_accepted}, Drafts: {self.total_drafts})"
+            )
+
+        if self.adaptive_enabled and self.acceptance_history:
+            avg_acceptance = sum(self.acceptance_history) / len(self.acceptance_history)
+            logger.info(
+                f"[PEARL] Adaptive stats: Current draft tokens={self.current_draft_tokens}, "
+                f"Recent acceptance rate={avg_acceptance:.2%}"
             )
 
     def __del__(self):

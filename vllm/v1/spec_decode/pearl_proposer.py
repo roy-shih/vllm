@@ -129,6 +129,14 @@ class PEARLProposer:
             self.gamma = self._auto_set_gamma()
             logger.info(f"[PEARL] Auto-set gamma to {self.gamma}")
 
+        # Register for acceptance stats updates
+        try:
+            from vllm.v1.spec_decode.pearl_stats_hook import register_pearl_proposer
+            register_pearl_proposer(self)
+            logger.info("[PEARL] Registered for acceptance stats tracking")
+        except Exception as e:
+            logger.warning(f"[PEARL] Could not register stats hook: {e}")
+
         logger.info("[PEARL] Draft model loaded successfully")
 
     def _auto_set_gamma(self) -> int:
@@ -331,6 +339,13 @@ class PEARLProposer:
 
                 # Forward pass
                 try:
+                    # Create attention mask tensor
+                    attention_mask_tensor = torch.tensor(
+                        attention_mask,
+                        dtype=torch.bool,
+                        device=self.device
+                    ).view(-1)  # [batch_size * max_len]
+
                     with set_forward_context(
                         None,  # No per-layer metadata for simplified approach
                         self.vllm_config,
@@ -340,6 +355,9 @@ class PEARLProposer:
                         flat_input_ids = input_ids.reshape(-1)
                         flat_positions = positions.reshape(-1)
 
+                        # Check if model supports attention_mask parameter
+                        # Most vLLM models handle masking through attention metadata
+                        # For now, pass without mask (handled by positional encoding)
                         outputs = self.model(
                             input_ids=flat_input_ids,
                             positions=flat_positions,

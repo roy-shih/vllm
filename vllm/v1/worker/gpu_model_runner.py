@@ -392,8 +392,8 @@ class GPUModelRunner(
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.method == "pearl":
-                self.drafter = PEARLProposer(self.vllm_config)
-                # Load draft and target models
+                self.drafter = PEARLProposer(self.vllm_config, self.device, self)
+                # Load draft model
                 self.drafter.load_model(self.model.model)
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
@@ -3413,12 +3413,36 @@ class GPUModelRunner(
         elif spec_config.method == "pearl":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, PEARLProposer)
+
+            # Prepare inputs similar to Medusa/EAGLE
+            # Get the indices of last tokens for each request
+            batch_size = len(sampled_token_ids)
+            last_token_indices = []
+            for i in range(batch_size):
+                if sampled_token_ids[i]:
+                    last_token_indices.append(i)
+
+            # Convert sampled tokens to next_token_ids tensor
+            next_token_ids = []
+            for tokens in sampled_token_ids:
+                if tokens:
+                    next_token_ids.append(tokens[-1])
+                else:
+                    next_token_ids.append(0)  # Placeholder for empty
+            next_token_ids = torch.tensor(
+                next_token_ids, dtype=torch.int32, device=self.device
+            )
+
+            # Call propose with EAGLE-style interface
             draft_token_ids = self.drafter.propose(
-                sampled_token_ids,
-                self.input_batch.req_ids,
-                self.input_batch.num_tokens_no_spec,
-                self.input_batch.token_ids_cpu,
-                self.input_batch.spec_decode_unsupported_reqs,
+                target_token_ids=self.input_ids.gpu[:num_scheduled_tokens],
+                target_positions=self._get_positions(num_scheduled_tokens),
+                target_hidden_states=hidden_states[:num_scheduled_tokens],
+                next_token_ids=next_token_ids,
+                last_token_indices=None,
+                common_attn_metadata=common_attn_metadata,
+                sampling_metadata=sampling_metadata,
+                mm_embed_inputs=None,
             )
         elif spec_config.method == "suffix":
             assert isinstance(sampled_token_ids, list)

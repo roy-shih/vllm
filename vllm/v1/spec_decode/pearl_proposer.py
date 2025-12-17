@@ -312,11 +312,22 @@ class PEARLProposer:
                     device=self.device
                 )  # [batch_size, max_len]
 
-                positions = torch.arange(
-                    max_len,
+                # Calculate correct positions for each sequence
+                # For left-padded sequences, padding tokens get position 0,
+                # real tokens get incremental positions starting from 0
+                positions_list = []
+                for seq in current_sequences:
+                    actual_len = min(len(seq), max_len)
+                    padding_len = max_len - actual_len
+                    # Padding positions = 0, real tokens get positions [0, 1, 2, ...]
+                    seq_positions = [0] * padding_len + list(range(actual_len))
+                    positions_list.append(seq_positions)
+
+                positions = torch.tensor(
+                    positions_list,
                     dtype=torch.long,
                     device=self.device
-                ).unsqueeze(0).expand(batch_size, -1)  # [batch_size, max_len]
+                )  # [batch_size, max_len]
 
                 # Forward pass
                 try:

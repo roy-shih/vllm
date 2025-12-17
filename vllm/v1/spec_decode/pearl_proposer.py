@@ -137,13 +137,17 @@ class PEARLProposer:
 
         This method follows EAGLE's interface to properly integrate with vLLM.
 
+        Note: For MVP, we're doing auto-regressive generation without full KV cache
+        optimization. The draft model has its own separate KV cache context that
+        needs to be managed independently from the target model.
+
         Args:
             target_token_ids: Token IDs from target model output
             target_positions: Position IDs for target tokens
             target_hidden_states: Hidden states from target model
             next_token_ids: Next token IDs for each request
             last_token_indices: Indices of last tokens for each request
-            common_attn_metadata: Attention metadata (KV cache info)
+            common_attn_metadata: Attention metadata (for target model's KV cache)
             sampling_metadata: Sampling parameters
             mm_embed_inputs: Multimodal embeddings (if applicable)
 
@@ -171,91 +175,164 @@ class PEARLProposer:
             f"num_spec_tokens={self.num_speculative_tokens}"
         )
 
-        # Prepare initial input for draft model
-        # Use next_token_ids as the starting point
-        current_tokens = next_token_ids.clone()  # [batch_size]
+        # Get the actual sequences from the target model
+        # We need to extract the token sequences for each request in the batch
+        # using last_token_indices to determine sequence boundaries
 
-        draft_tokens_list = []
+        # Build list of token sequences for each request
+        token_sequences = []
+        query_start_loc = common_attn_metadata.query_start_loc
 
-        # Auto-regressive generation
-        for step in range(self.num_speculative_tokens):
-            # Prepare inputs for this step
-            # TODO: This is still simplified - need to properly manage KV cache
-            # For now, we'll do a simplified version that at least uses the interface
+        for i in range(batch_size):
+            start_idx = query_start_loc[i]
+            end_idx = query_start_loc[i + 1]
+            seq_tokens = target_token_ids[start_idx:end_idx].tolist()
+            # Append the newly sampled token
+            seq_tokens.append(next_token_ids[i].item())
+            token_sequences.append(seq_tokens)
 
-            # Expand to all tokens if needed
-            if step == 0:
-                # First step: use the next tokens from target
-                input_ids = current_tokens  # [batch_size]
-                # Get positions for these tokens
-                # TODO: Need proper position calculation
-                positions = torch.zeros_like(current_tokens, dtype=torch.int64)
-            else:
-                # Subsequent steps: use previously generated drafts
-                input_ids = current_tokens
-                positions = torch.zeros_like(current_tokens, dtype=torch.int64)
+        logger.debug(f"[PEARL] Token sequences lengths: {[len(s) for s in token_sequences]}")
 
-            try:
-                # Forward pass
-                # TODO: Need to properly set up attention metadata for draft model
-                # For now, simplified call
-                with set_forward_context(
-                    None,  # TODO: Need per-layer attention metadata
-                    self.vllm_config,
-                    num_tokens=batch_size,
-                ):
-                    # This is still simplified - in production need proper setup
-                    self.input_ids[:batch_size] = input_ids
-                    self.positions[:batch_size] = positions
+        # Generate draft tokens for each sequence in the batch
+        all_draft_tokens = []
 
-                    hidden_states = self.model(
-                        input_ids=self.input_ids[:batch_size],
-                        positions=self.positions[:batch_size],
-                    )
+        for seq_idx, token_seq in enumerate(token_sequences):
+            draft_tokens = self._generate_draft_tokens_for_sequence(
+                token_ids=token_seq,
+                num_draft_tokens=self.num_speculative_tokens,
+            )
+            all_draft_tokens.append(draft_tokens)
 
-                # Compute logits
-                if isinstance(hidden_states, tuple):
-                    hidden_states = hidden_states[0]
+        # Convert to tensor: [batch_size, num_speculative_tokens]
+        result = torch.zeros(
+            (batch_size, self.num_speculative_tokens),
+            dtype=torch.int32,
+            device=self.device,
+        )
 
-                logits = self.model.compute_logits(hidden_states)  # [batch_size, vocab_size]
-
-                # Greedy sampling
-                next_tokens = logits.argmax(dim=-1)  # [batch_size]
-
-                draft_tokens_list.append(next_tokens)
-
-                # Update for next iteration
-                current_tokens = next_tokens
-
-            except Exception as e:
-                logger.warning(
-                    f"[PEARL] Error in step {step}: {e}. "
-                    f"Returning {len(draft_tokens_list)} tokens so far."
+        for i, draft_tokens in enumerate(all_draft_tokens):
+            num_generated = len(draft_tokens)
+            if num_generated > 0:
+                result[i, :num_generated] = torch.tensor(
+                    draft_tokens, dtype=torch.int32, device=self.device
                 )
-                break
-
-        if not draft_tokens_list:
-            # Return zeros if no tokens generated
-            return torch.zeros(
-                (batch_size, self.num_speculative_tokens),
-                dtype=torch.int32,
-                device=self.device,
-            )
-
-        # Stack: [batch_size, num_generated_tokens]
-        draft_tokens = torch.stack(draft_tokens_list, dim=1)
-
-        # Pad if needed
-        if draft_tokens.shape[1] < self.num_speculative_tokens:
-            padding = torch.zeros(
-                (batch_size, self.num_speculative_tokens - draft_tokens.shape[1]),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            draft_tokens = torch.cat([draft_tokens, padding], dim=1)
 
         logger.debug(
-            f"[PEARL] Generated draft_tokens shape: {draft_tokens.shape}"
+            f"[PEARL] Generated draft_tokens shape: {result.shape}"
+        )
+
+        return result
+
+    def _generate_draft_tokens_for_sequence(
+        self,
+        token_ids: list[int],
+        num_draft_tokens: int,
+    ) -> list[int]:
+        """
+        Generate draft tokens for a single sequence using auto-regressive generation.
+
+        This is a simplified implementation that generates tokens one-by-one.
+        For MVP, we're not using KV cache optimization yet.
+
+        Args:
+            token_ids: Input token sequence
+            num_draft_tokens: Number of draft tokens to generate
+
+        Returns:
+            List of draft token IDs
+        """
+        if not token_ids:
+            logger.warning("[PEARL] Empty token_ids provided")
+            return []
+
+        draft_tokens = []
+        current_seq = token_ids.copy()
+
+        try:
+            for step in range(num_draft_tokens):
+                # Prepare input tensors for current sequence
+                seq_len = len(current_seq)
+
+                # Truncate if sequence is too long
+                if seq_len > self.max_model_len:
+                    current_seq = current_seq[-(self.max_model_len - 1):]
+                    seq_len = len(current_seq)
+
+                input_ids = torch.tensor(
+                    [current_seq],
+                    dtype=torch.long,
+                    device=self.device
+                )  # [1, seq_len]
+
+                # Position IDs: [0, 1, 2, ..., seq_len-1]
+                positions = torch.arange(
+                    seq_len,
+                    dtype=torch.long,
+                    device=self.device
+                ).unsqueeze(0)  # [1, seq_len]
+
+                # Forward pass through draft model
+                # Note: Without KV cache, we recompute the entire sequence each time
+                # This is inefficient but simpler for MVP
+                try:
+                    with set_forward_context(
+                        None,  # No per-layer metadata for simplified approach
+                        self.vllm_config,
+                        num_tokens=seq_len,
+                    ):
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            positions=positions,
+                        )
+
+                    # Extract hidden states
+                    if isinstance(outputs, tuple):
+                        hidden_states = outputs[0]
+                    else:
+                        hidden_states = outputs
+
+                    # Get logits for the last position
+                    if hidden_states.dim() == 3:
+                        # [batch=1, seq_len, hidden_size]
+                        last_hidden = hidden_states[0, -1, :]  # [hidden_size]
+                    else:
+                        # [seq_len, hidden_size]
+                        last_hidden = hidden_states[-1, :]
+
+                    # Compute logits
+                    logits = self.model.compute_logits(
+                        last_hidden.unsqueeze(0)
+                    )  # [1, vocab_size]
+
+                    # Greedy sampling
+                    next_token = logits.argmax(dim=-1).item()
+
+                    # Add to draft tokens
+                    draft_tokens.append(next_token)
+                    current_seq.append(next_token)
+
+                    logger.debug(
+                        f"[PEARL] Step {step+1}/{num_draft_tokens}: "
+                        f"Generated token {next_token} (seq_len={seq_len})"
+                    )
+
+                except Exception as e:
+                    logger.warning(
+                        f"[PEARL] Error in draft forward pass at step {step}: {e}. "
+                        f"Returning {len(draft_tokens)} tokens generated so far."
+                    )
+                    import traceback
+                    logger.debug(f"[PEARL] Traceback: {traceback.format_exc()}")
+                    break
+
+        except Exception as e:
+            logger.error(f"[PEARL] Error generating draft tokens: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+        logger.debug(
+            f"[PEARL] Generated {len(draft_tokens)} draft tokens "
+            f"from {len(token_ids)} input tokens"
         )
 
         return draft_tokens

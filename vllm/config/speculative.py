@@ -170,6 +170,14 @@ class SpeculativeConfig:
     """The degree of tensor parallelism for the target model in PEARL.
     Only used when method is 'pearl'."""
 
+    pearl_draft_gpu_id: int = 0
+    """The GPU ID to use for the draft model worker process.
+    Default to 0 (Assuming single GPU or same GPU for Phase 1 testing, 
+    user should change this for multi-gpu isolation)."""
+
+    pearl_ipc_buffer_size: int = 1024 * 1024 * 10 
+    """Size of shared memory buffer for PEARL IPC (in bytes). Default 10MB."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

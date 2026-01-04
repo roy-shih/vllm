@@ -7,7 +7,7 @@ import itertools
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from functools import reduce
 from itertools import product
@@ -43,10 +43,13 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     get_dcp_group,
+    get_dp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
+    init_model_parallel_group,
     is_global_first_rank,
+    patch_tensor_parallel_group,
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import (
@@ -140,13 +143,33 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.rejection_sampler import (
+    PLACEHOLDER_TOKEN_ID,
+    RejectionSampler,
+    apply_sampling_constraints,
+)
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
+from vllm.v1.spec_decode.pearl_kv import (
+    PearlKVAdapter,
+    slot_mapping_from_logical_blocks,
+    context_lens_from_windows,
+)
+from vllm.v1.spec_decode.pearl_dist import (
+    PearlGroups,
+    init_pearl_groups,
+    pack_pearl_proposals,
+    pack_pearl_proposal_logprobs,
+    unpack_pearl_proposals,
+    unpack_pearl_proposal_logprobs,
+)
+from vllm.v1.spec_decode.pearl_kv import PearlKVAdapter
+from vllm.v1.spec_decode.pearl_sampler import PearlRejectionSampler
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
@@ -275,6 +298,7 @@ class GPUModelRunner(
         self,
         vllm_config: VllmConfig,
         device: torch.device,
+        pearl_groups: PearlGroups | None = None,
     ):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -286,6 +310,38 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self.pearl_groups: PearlGroups | None = None
+        self.pearl_kv_adapter: PearlKVAdapter | None = None
+        self.pearl_context_lens: CpuGpuBuffer | None = None
+        self.pearl_is_draft: bool = False
+        self.pearl_draft_model: torch.nn.Module | None = None
+        self.pearl_in_draft: bool = False
+        # Collect freed block ids from PEARL rollback for future scheduler hookup.
+        self.pearl_freed_block_ids: list[int] = []
+        self.pearl_pre_verify: dict[str, bool] = {}
+        self.pearl_pending_proposals: dict[str, list[int]] | None = None
+        self.pearl_pending_proposal_logprobs: dict[
+            str, list[tuple[np.ndarray, np.ndarray, int | None]]
+        ] | None = None
+        self.pearl_pending_verification: dict[str, dict[str, int | bool]] | None = None
+        self.pearl_last_scheduler_output: SchedulerOutput | None = None
+        self.pearl_tp_group = None
+        self.pearl_tp_group_name: str | None = None
+        self.pearl_auto_gamma_value: int | None = None
+        self.pearl_auto_gamma_samples = 0
+        self.pearl_auto_gamma_draft_time = 0.0
+        self.pearl_auto_gamma_target_time = 0.0
+        self.pearl_auto_gamma_draft_tokens = 0.0
+        self.pearl_auto_gamma_target_tokens = 0.0
+        self.pearl_auto_gamma_bins = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+        self.pearl_auto_gamma_table: dict[int, int] = {}
+        self.pearl_auto_gamma_stats: dict[int, dict[str, float]] = {}
+        self.pearl_auto_gamma_min_samples = 3
+        self.pearl_last_draft_time = 0.0
+        self.pearl_last_target_time = 0.0
+        self.pearl_last_draft_tokens = 0
+        self.pearl_last_target_tokens = 0
+        self.pearl_last_batch_size = 0
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 
@@ -346,13 +402,49 @@ class GPUModelRunner(
             model_config
         )
 
+        # Initialize PEARL NCCL subgroups if requested.
+        if self.speculative_config and self.speculative_config.method == "pearl":
+            if pearl_groups is not None:
+                self.pearl_groups = pearl_groups
+                self.pearl_is_draft = pearl_groups.role.is_draft
+            else:
+                try:
+                    self.pearl_groups = init_pearl_groups(self.speculative_config)
+                    self.pearl_is_draft = self.pearl_groups.role.is_draft
+                    logger.info(
+                        "Initialized PEARL groups: is_draft=%s local_rank=%d "
+                        "draft_ranks=%s target_ranks=%s",
+                        self.pearl_groups.role.is_draft,
+                        self.pearl_groups.role.local_rank,
+                        self.pearl_groups.role.draft_ranks,
+                        self.pearl_groups.role.target_ranks,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to initialize PEARL groups: %s", e)
+            if self.pearl_groups is not None:
+                role = self.pearl_groups.role
+                tp_ranks = (
+                    role.draft_ranks if role.is_draft else role.target_ranks
+                )
+                tp_name = "pearl_draft_tp" if role.is_draft else "pearl_target_tp"
+                try:
+                    backend = torch.distributed.get_backend()
+                    self.pearl_tp_group = init_model_parallel_group(
+                        group_ranks=[tp_ranks],
+                        local_rank=get_tp_group().local_rank,
+                        backend=backend,
+                        group_name=tp_name,
+                    )
+                    self.pearl_tp_group_name = tp_name
+                except Exception as e:
+                    logger.warning("Failed to init PEARL TP group: %s", e)
+
         if self.model_config.is_encoder_decoder:
             # Maximum length of the encoder input, only for encoder-decoder
             # models.
             self.max_encoder_len = scheduler_config.max_num_encoder_input_tokens
         else:
             self.max_encoder_len = 0
-
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
@@ -382,10 +474,8 @@ class GPUModelRunner(
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
         # layers in the draft model.
+        self.drafter = None
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.drafter: (
-                NgramProposer | SuffixDecodingProposer | EagleProposer | MedusaProposer
-            )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "suffix":
@@ -400,12 +490,18 @@ class GPUModelRunner(
                 self.drafter = MedusaProposer(
                     vllm_config=self.vllm_config, device=self.device
                 )
+            elif self.speculative_config.method == "pearl":
+                # PEARL uses a dual-model runner; drafter handled separately.
+                self.drafter = None
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
-            self.rejection_sampler = RejectionSampler(self.sampler)
+            if self.speculative_config.method == "pearl":
+                self.rejection_sampler = PearlRejectionSampler(self.sampler)
+            elif self.drafter is not None:
+                self.rejection_sampler = RejectionSampler(self.sampler)
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -456,6 +552,16 @@ class GPUModelRunner(
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
+        # Initialize PEARL KV adapter once block tables are available.
+        if self.speculative_config and self.speculative_config.method == "pearl":
+            self.pearl_kv_adapter = PearlKVAdapter(self.input_batch.block_table)
+            self.pearl_context_lens = self._make_buffer(
+                self.max_num_tokens, dtype=torch.int32
+            )
+            # Wire rollback free callback to collect freed block ids; scheduler hookup TBD.
+            self.input_batch.block_table.set_free_block_callback(
+                self._pearl_record_freed_blocks
+            )
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -766,6 +872,11 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.pearl_pre_verify.pop(req_id, None)
+            if self.pearl_pending_proposals is not None:
+                self.pearl_pending_proposals.pop(req_id, None)
+            if self.pearl_pending_proposal_logprobs is not None:
+                self.pearl_pending_proposal_logprobs.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1010,6 +1121,12 @@ class GPUModelRunner(
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
             self.input_batch.add_request(request)
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "pearl"
+                and request.req_id not in self.pearl_pre_verify
+            ):
+                self.pearl_pre_verify[request.req_id] = True
 
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
@@ -1409,8 +1526,53 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        # Slot mapping: PEARL uses adapter to avoid req/position misalignment;
+        # other methods keep the standard path.
+        if self.speculative_config and self.speculative_config.method == "pearl":
+            assert self.pearl_kv_adapter is not None
+            assert self.pearl_context_lens is not None
+            slot_mapping = self.pearl_kv_adapter.build_slot_mapping_for_batch(
+                req_indices=req_indices, positions=positions_np
+            )
+            # Validate shape and dtype; non-local tokens (DCP/PCP) are masked with -1.
+            assert (
+                slot_mapping.numel() == total_num_scheduled_tokens
+            ), "PEARL slot_mapping size mismatch"
+            assert slot_mapping.dtype == torch.int64, "PEARL slot_mapping must be int64"
+            slot_tensor = self.pearl_kv_adapter.block_table.slot_mapping.cpu
+            slot_tensor[:total_num_scheduled_tokens] = slot_mapping
+            if slot_tensor.shape[0] > total_num_scheduled_tokens:
+                slot_tensor[total_num_scheduled_tokens:] = -1
+            self.pearl_kv_adapter.block_table.commit_slot_mapping(
+                total_num_scheduled_tokens
+            )
+            seq_lens_np = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                + num_scheduled_tokens
+            )
+            context_lens = self.pearl_kv_adapter.build_context_lens_for_batch(
+                seq_lens=seq_lens_np,
+                window_sizes=num_scheduled_tokens,
+                slot_mapping=slot_tensor[:total_num_scheduled_tokens],
+            )
+            assert (
+                context_lens.numel() == total_num_scheduled_tokens
+            ), "PEARL context_lens size mismatch"
+            assert (
+                context_lens.dtype == torch.int32
+            ), "PEARL context_lens must be int32"
+            context_tensor = self.pearl_context_lens.cpu
+            context_tensor[:total_num_scheduled_tokens] = context_lens
+            if context_tensor.shape[0] > total_num_scheduled_tokens:
+                context_tensor[total_num_scheduled_tokens:] = -1
+            self.pearl_context_lens.copy_to_gpu(total_num_scheduled_tokens)
+        else:
+            self.input_batch.block_table.compute_slot_mapping(
+                req_indices, positions_np
+            )
+            self.input_batch.block_table.commit_slot_mapping(
+                total_num_scheduled_tokens
+            )
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
@@ -1497,6 +1659,14 @@ class GPUModelRunner(
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens, cu_num_tokens
             )
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "pearl"
+            ):
+                spec_decode_metadata.pre_verify = [
+                    self.pearl_pre_verify.get(req_id, True)
+                    for req_id in self.input_batch.req_ids
+                ]
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
@@ -1592,6 +1762,16 @@ class GPUModelRunner(
             return blk_table_tensor, slot_mapping
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
+        context_lens_tensor = None
+        if (
+            self.speculative_config
+            and self.speculative_config.method == "pearl"
+            and self.pearl_context_lens is not None
+        ):
+            context_lens_tensor = self.pearl_context_lens.gpu[:num_tokens_padded]
+            assert (
+                context_lens_tensor.shape[0] >= num_tokens
+            ), "PEARL context_lens must cover scheduled tokens"
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -1607,6 +1787,7 @@ class GPUModelRunner(
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
             causal=True,
+            context_lens=context_lens_tensor,
         )
 
         if self.dcp_world_size > 1:
@@ -2577,6 +2758,332 @@ class GPUModelRunner(
         self._update_states_after_model_execute(sampler_output.sampled_token_ids)
         return sampler_output
 
+    def _sample_pearl(
+        self,
+        scheduler_output: "SchedulerOutput",
+        logits: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata,
+    ) -> tuple[
+        SamplerOutput,
+        dict[str, dict[str, int | bool]],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        sampling_metadata = self.input_batch.sampling_metadata
+        bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
+        target_logits_indices = spec_decode_metadata.target_logits_indices
+        batch_size = len(spec_decode_metadata.num_draft_tokens)
+        device = logits.device
+
+        bonus_logits = logits[bonus_logits_indices]
+        bonus_logits_raw = bonus_logits.to(torch.float32)
+        bonus_logits_processed = self.sampler.apply_logits_processors(
+            bonus_logits_raw.clone(),
+            sampling_metadata,
+            predict_bonus_token=True,
+        )
+        if batch_size > 0:
+            bonus_cu_num_tokens = torch.arange(
+                1, batch_size + 1, device=device, dtype=torch.int32
+            )
+            bonus_logits_for_probs = apply_sampling_constraints(
+                bonus_logits_processed.clone(),
+                bonus_cu_num_tokens,
+                sampling_metadata,
+            )
+        else:
+            bonus_logits_for_probs = bonus_logits_processed
+        bonus_sampler_output = self.sampler(
+            logits=bonus_logits,
+            sampling_metadata=sampling_metadata,
+            predict_bonus_token=True,
+            logprobs_mode_override="processed_logits"
+            if self.rejection_sampler.is_processed_logprobs_mode
+            else "raw_logits",
+        )
+        bonus_token_ids = bonus_sampler_output.sampled_token_ids.squeeze(-1)
+
+        raw_target_logits = logits[target_logits_indices].to(torch.float32)
+        target_logits = self.rejection_sampler.apply_logits_processors(
+            raw_target_logits, sampling_metadata, spec_decode_metadata
+        )
+        target_logits = apply_sampling_constraints(
+            target_logits,
+            spec_decode_metadata.cu_num_draft_tokens,
+            sampling_metadata,
+        )
+        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+        bonus_probs = bonus_logits_for_probs.softmax(dim=-1, dtype=torch.float32)
+
+        output_tokens: list[list[int]] = []
+        acc_flags: list[bool] = []
+        rollouts: list[int] = []
+        revise_tokens: list[int] = []
+        output_sources: list[str] = []
+        revise_sources: list[tuple[str, int] | None] = [None] * batch_size
+
+        draft_tokens_flat = spec_decode_metadata.draft_token_ids.tolist()
+        pre_verify_flags = (
+            spec_decode_metadata.pre_verify
+            if spec_decode_metadata.pre_verify is not None
+            else [False] * batch_size
+        )
+        next_round = self.pearl_pending_proposals or {}
+
+        def accept_or_revise(
+            probs: torch.Tensor,
+            token: int,
+            gen: torch.Generator | None,
+        ) -> tuple[bool, int]:
+            if sampling_metadata.all_greedy:
+                chosen = int(probs.argmax().item())
+                return chosen == token, chosen
+            u = torch.rand((), device=device, generator=gen)
+            if u <= probs[token]:
+                return True, token
+            masked = probs.clone()
+            masked[token] = 0.0
+            if masked.sum() == 0:
+                return False, token
+            revised = int(torch.multinomial(masked, 1, generator=gen).item())
+            return False, revised
+
+        cursor = 0
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            num_draft = spec_decode_metadata.num_draft_tokens[req_idx]
+            draft_tokens = draft_tokens_flat[cursor : cursor + num_draft]
+            cursor += num_draft
+            next_tokens = next_round.get(req_id, [])
+            pre_verify = pre_verify_flags[req_idx]
+            gen = sampling_metadata.generators.get(req_idx)
+
+            if num_draft == 0 or not next_tokens:
+                token = int(bonus_token_ids[req_idx].item())
+                output_tokens.append([token])
+                acc_flags.append(True)
+                rollouts.append(0)
+                revise_tokens.append(-1)
+                output_sources.append("bonus")
+                continue
+
+            if pre_verify:
+                probs = target_probs[cursor - num_draft]
+                accepted, revised = accept_or_revise(
+                    probs, int(next_tokens[0]), gen
+                )
+                if accepted:
+                    output_tokens.append(list(next_tokens))
+                    acc_flags.append(True)
+                    rollouts.append(0)
+                    revise_tokens.append(-1)
+                    output_sources.append("draft")
+                else:
+                    output_tokens.append([int(revised)])
+                    acc_flags.append(False)
+                    rollouts.append(num_draft)
+                    revise_tokens.append(int(revised))
+                    output_sources.append("revised")
+                    revise_sources[req_idx] = ("target", cursor - num_draft)
+                continue
+
+            accepted_all = True
+            accepted_draft = num_draft
+            revised = -1
+            revise_source: tuple[str, int] | None = None
+
+            for j in range(max(num_draft - 1, 0)):
+                token = int(draft_tokens[j + 1])
+                probs = target_probs[cursor - num_draft + j + 1]
+                accepted, revised_tok = accept_or_revise(probs, token, gen)
+                if not accepted:
+                    accepted_all = False
+                    accepted_draft = j + 1
+                    revised = revised_tok
+                    revise_source = ("target", cursor - num_draft + j + 1)
+                    break
+
+            if accepted_all:
+                probs = bonus_probs[req_idx]
+                accepted, revised_tok = accept_or_revise(
+                    probs, int(next_tokens[0]), gen
+                )
+                if not accepted:
+                    accepted_all = False
+                    accepted_draft = num_draft
+                    revised = revised_tok
+                    revise_source = ("bonus", req_idx)
+
+            if accepted_all:
+                output_tokens.append(list(next_tokens))
+                acc_flags.append(True)
+                rollouts.append(0)
+                revise_tokens.append(-1)
+                output_sources.append("draft")
+            else:
+                output_tokens.append([int(revised)])
+                acc_flags.append(False)
+                rollouts.append(max(num_draft - accepted_draft, 0))
+                revise_tokens.append(int(revised))
+                output_sources.append("revised")
+                if revise_source is None:
+                    revise_source = ("bonus", req_idx)
+                revise_sources[req_idx] = revise_source
+
+        max_len = max((len(tokens) for tokens in output_tokens), default=0)
+        output_token_ids = torch.full(
+            (batch_size, max_len),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,
+            device=device,
+        )
+        for row_idx, tokens in enumerate(output_tokens):
+            if not tokens:
+                continue
+            output_token_ids[row_idx, : len(tokens)] = torch.tensor(
+                tokens, dtype=torch.int32, device=device
+            )
+
+        verify_result = {
+            req_id: {
+                "acc": acc_flags[i],
+                "rollout": int(rollouts[i]),
+                "revise": int(revise_tokens[i]),
+                "finish": False,
+            }
+            for i, req_id in enumerate(self.input_batch.req_ids)
+        }
+        acc_tensor = torch.tensor(acc_flags, device=device, dtype=torch.int32)
+        rollout_tensor = torch.tensor(rollouts, device=device, dtype=torch.int32)
+        revise_tensor = torch.tensor(revise_tokens, device=device, dtype=torch.int32)
+
+        logprobs_tensors = None
+        max_num_logprobs = sampling_metadata.max_num_logprobs
+        if max_num_logprobs is not None:
+            draft_logprobs = self.pearl_pending_proposal_logprobs or {}
+            use_processed = self.rejection_sampler.is_processed_logprobs_mode
+            use_logits = self.rejection_sampler.is_logits_logprobs_mode
+            target_logits_for_logprobs = (
+                target_logits if use_processed else raw_target_logits
+            )
+            if use_processed:
+                bonus_logits_for_logprobs = bonus_logits_processed
+            else:
+                bonus_logits_for_logprobs = bonus_logits_raw
+
+            logprob_token_rows: list[np.ndarray] = []
+            logprob_rows: list[np.ndarray] = []
+            selected_rank_rows: list[int] = []
+            full_logprob_rows: list[np.ndarray] = []
+
+            def append_from_logits(logits_row: torch.Tensor, token: int) -> None:
+                if max_num_logprobs == -1:
+                    if use_logits:
+                        values = logits_row.to(torch.float32)
+                    else:
+                        values = self.sampler.compute_logprobs(
+                            logits_row.to(torch.float32)
+                        )
+                    full_logprob_rows.append(values.cpu().numpy())
+                    return
+                if use_logits:
+                    logprob_values = logits_row.to(torch.float32)
+                else:
+                    logprob_values = self.sampler.compute_logprobs(
+                        logits_row.to(torch.float32)
+                    )
+                gathered = self.sampler.gather_logprobs(
+                    logprob_values.unsqueeze(0),
+                    max_num_logprobs,
+                    torch.tensor([token], device=logits_row.device, dtype=torch.int64),
+                )
+                logprob_token_rows.append(
+                    gathered.logprob_token_ids.squeeze(0).cpu().numpy()
+                )
+                logprob_rows.append(gathered.logprobs.squeeze(0).cpu().numpy())
+                selected_rank_rows.append(
+                    int(gathered.selected_token_ranks.squeeze(0).item())
+                )
+
+            def append_from_draft(row: tuple[np.ndarray, np.ndarray, int | None]) -> None:
+                logprob_token_ids, logprobs, rank = row
+                if max_num_logprobs == -1:
+                    full_logprob_rows.append(np.asarray(logprobs))
+                    return
+                logprob_token_rows.append(np.asarray(logprob_token_ids))
+                logprob_rows.append(np.asarray(logprobs))
+                selected_rank_rows.append(int(rank) if rank is not None else 0)
+
+            for req_idx, req_id in enumerate(self.input_batch.req_ids):
+                tokens = output_tokens[req_idx]
+                if not tokens:
+                    continue
+                source = output_sources[req_idx]
+                if source == "draft":
+                    rows = draft_logprobs.get(req_id, [])
+                    for token_idx, token in enumerate(tokens):
+                        if token_idx < len(rows):
+                            append_from_draft(rows[token_idx])
+                        else:
+                            append_from_logits(
+                                bonus_logits_for_logprobs[req_idx], int(token)
+                            )
+                elif source == "bonus":
+                    append_from_logits(
+                        bonus_logits_for_logprobs[req_idx], int(tokens[0])
+                    )
+                else:
+                    revise_source = revise_sources[req_idx]
+                    if revise_source is None:
+                        append_from_logits(
+                            bonus_logits_for_logprobs[req_idx], int(tokens[0])
+                        )
+                    else:
+                        kind, idx = revise_source
+                        if kind == "target":
+                            logits_row = target_logits_for_logprobs[idx]
+                        else:
+                            logits_row = bonus_logits_for_logprobs[idx]
+                        append_from_logits(logits_row, int(tokens[0]))
+
+            if max_num_logprobs == -1:
+                if full_logprob_rows:
+                    logprobs_tensor = torch.tensor(
+                        np.stack(full_logprob_rows),
+                        dtype=torch.float32,
+                        device="cpu",
+                    )
+                    logprobs_tensors = LogprobsTensors(
+                        logprob_token_ids=torch.empty(
+                            0, dtype=torch.int32, device="cpu"
+                        ),
+                        logprobs=logprobs_tensor,
+                        selected_token_ranks=torch.empty(
+                            0, dtype=torch.int32, device="cpu"
+                        ),
+                    )
+            elif logprob_rows:
+                logprobs_tensors = LogprobsTensors(
+                    logprob_token_ids=torch.tensor(
+                        np.stack(logprob_token_rows),
+                        dtype=torch.int32,
+                        device="cpu",
+                    ),
+                    logprobs=torch.tensor(
+                        np.stack(logprob_rows), dtype=torch.float32, device="cpu"
+                    ),
+                    selected_token_ranks=torch.tensor(
+                        selected_rank_rows, dtype=torch.int32, device="cpu"
+                    ),
+                )
+
+        sampler_output = SamplerOutput(
+            sampled_token_ids=output_token_ids,
+            logprobs_tensors=logprobs_tensors,
+        )
+        self._update_states_after_model_execute(sampler_output.sampled_token_ids)
+        return sampler_output, verify_result, acc_tensor, rollout_tensor, revise_tensor
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2729,6 +3236,7 @@ class GPUModelRunner(
         positions: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        model_override: torch.nn.Module | None = None,
         **model_kwargs: dict[str, Any],
     ) -> Any:
         """Helper method to call the model forward pass.
@@ -2747,7 +3255,8 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
-        return self.model(
+        model = model_override or self.model
+        return model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
@@ -2910,6 +3419,1195 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        """Entry point; PEARL can override for dual-model flow."""
+        if (
+            self.speculative_config
+            and self.speculative_config.method == "pearl"
+            and self.pearl_groups is not None
+        ):
+            return self._execute_model_pearl(scheduler_output, intermediate_tensors)
+        return self._execute_model_body(scheduler_output, intermediate_tensors)
+
+    def _execute_model_pearl(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | IntermediateTensors | None:
+        """PEARL dual-model hook using draft/target roles."""
+        # Fast-path: if PEARL groups are missing, fall back.
+        if self.pearl_groups is None:
+            return self._execute_model_body(scheduler_output, intermediate_tensors)
+        if get_tp_group().world_size > 1 and self.pearl_tp_group is None:
+            raise RuntimeError(
+                "PEARL requires split TP groups when TP>1. "
+                "Failed to initialize PEARL TP group; refusing to run."
+            )
+        role = self.pearl_groups.role
+        if role.is_draft:
+            # Draft role: generate proposals and broadcast to target ranks.
+            with self.synchronize_input_prep():
+                self._update_states(scheduler_output)
+            self.pearl_last_scheduler_output = scheduler_output
+            proposals: dict[str, list[int]] = {}
+            proposal_logprobs: dict[
+                str, list[tuple[np.ndarray, np.ndarray, int | None]]
+            ] | None = None
+            if scheduler_output.total_num_scheduled_tokens > 0:
+                proposals, proposal_logprobs = self._pearl_collect_draft_proposals(
+                    scheduler_output,
+                    intermediate_tensors,
+                )
+            proposals, proposal_logprobs = self._pearl_sync_proposals(
+                proposals, proposal_logprobs
+            )
+            self.pearl_pending_proposals = proposals
+            self.pearl_pending_proposal_logprobs = proposal_logprobs
+            logger.debug(
+                "PEARL draft: proposals=%d spec_tokens=%d",
+                len(proposals),
+                len(scheduler_output.scheduled_spec_decode_tokens),
+            )
+            self._pearl_maybe_autotune_gamma()
+            return None
+
+        target_start = (
+            time.perf_counter() if self._pearl_auto_gamma_enabled() else None
+        )
+        if self.pearl_tp_group is None:
+            output = self._execute_model_body(
+                scheduler_output,
+                intermediate_tensors,
+            )
+        else:
+            with patch_tensor_parallel_group(self.pearl_tp_group):
+                output = self._execute_model_body(
+                    scheduler_output,
+                    intermediate_tensors,
+                )
+        if target_start is not None:
+            elapsed = time.perf_counter() - target_start
+            self._pearl_record_target_profile(
+                scheduler_output.total_num_scheduled_tokens,
+                elapsed,
+                len(self.input_batch.req_ids) if self.input_batch is not None else 0,
+            )
+        proposals, proposal_logprobs = self._pearl_sync_proposals({}, None)
+        self.pearl_pending_proposals = proposals
+        self.pearl_pending_proposal_logprobs = proposal_logprobs
+        logger.debug(
+            "PEARL target: received proposals=%d spec_tokens=%d",
+            len(proposals),
+            len(scheduler_output.scheduled_spec_decode_tokens),
+        )
+        self._pearl_maybe_autotune_gamma()
+        return output
+
+    def _pearl_sync_proposals(
+        self,
+        proposals: dict[str, list[int]],
+        proposal_logprobs: dict[
+            str, list[tuple[np.ndarray, np.ndarray, int | None]]
+        ]
+        | None,
+    ) -> tuple[
+        dict[str, list[int]],
+        dict[str, list[tuple[np.ndarray, np.ndarray, int | None]]] | None,
+    ]:
+        """Broadcast proposals over the verify and draft subgroups."""
+        if self.pearl_groups is None or self.pearl_groups.verify_group is None:
+            return proposals, proposal_logprobs
+        role = self.pearl_groups.role
+        should_broadcast_verify = (not role.is_draft) or role.local_rank == 0
+        should_broadcast_draft = (
+            role.is_draft and self.pearl_groups.draft_group is not None
+        )
+        max_num_logprobs = None
+        if self.input_batch is not None:
+            max_num_logprobs = self.input_batch.sampling_metadata.max_num_logprobs
+        if max_num_logprobs is None and self.input_batch is not None:
+            gamma = self._pearl_get_gamma()
+            if gamma <= 0:
+                return proposals, proposal_logprobs
+            req_ids = self.input_batch.req_ids
+            if not req_ids:
+                return proposals, proposal_logprobs
+            packed = pack_pearl_proposals(req_ids, proposals, gamma, self.device)
+            try:
+                if should_broadcast_verify:
+                    torch.distributed.broadcast(
+                        packed,
+                        src=role.draft_ranks[0],
+                        group=self.pearl_groups.verify_group,
+                    )
+                if should_broadcast_draft:
+                    torch.distributed.broadcast(
+                        packed,
+                        src=role.draft_ranks[0],
+                        group=self.pearl_groups.draft_group,
+                    )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("PEARL proposal tensor broadcast skipped: %s", exc)
+                return proposals, proposal_logprobs
+            proposals = unpack_pearl_proposals(req_ids, packed)
+            return proposals, proposal_logprobs
+        if (
+            max_num_logprobs is not None
+            and max_num_logprobs != -1
+            and self.input_batch is not None
+        ):
+            gamma = self._pearl_get_gamma()
+            if gamma <= 0:
+                return proposals, proposal_logprobs
+            req_ids = self.input_batch.req_ids
+            if not req_ids:
+                return proposals, proposal_logprobs
+            (
+                packed_tokens,
+                packed_logprob_token_ids,
+                packed_logprobs,
+                packed_ranks,
+            ) = pack_pearl_proposal_logprobs(
+                req_ids,
+                proposals,
+                proposal_logprobs or {},
+                gamma,
+                max_num_logprobs,
+                self.device,
+            )
+            try:
+                if should_broadcast_verify:
+                    torch.distributed.broadcast(
+                        packed_tokens,
+                        src=role.draft_ranks[0],
+                        group=self.pearl_groups.verify_group,
+                    )
+                    torch.distributed.broadcast(
+                        packed_logprob_token_ids,
+                        src=role.draft_ranks[0],
+                        group=self.pearl_groups.verify_group,
+                    )
+                    torch.distributed.broadcast(
+                        packed_logprobs,
+                        src=role.draft_ranks[0],
+                        group=self.pearl_groups.verify_group,
+                    )
+                    torch.distributed.broadcast(
+                        packed_ranks,
+                        src=role.draft_ranks[0],
+                        group=self.pearl_groups.verify_group,
+                    )
+                if should_broadcast_draft:
+                    torch.distributed.broadcast(
+                        packed_tokens,
+                        src=role.draft_ranks[0],
+                        group=self.pearl_groups.draft_group,
+                    )
+                    torch.distributed.broadcast(
+                        packed_logprob_token_ids,
+                        src=role.draft_ranks[0],
+                        group=self.pearl_groups.draft_group,
+                    )
+                    torch.distributed.broadcast(
+                        packed_logprobs,
+                        src=role.draft_ranks[0],
+                        group=self.pearl_groups.draft_group,
+                    )
+                    torch.distributed.broadcast(
+                        packed_ranks,
+                        src=role.draft_ranks[0],
+                        group=self.pearl_groups.draft_group,
+                    )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(
+                    "PEARL proposal logprob tensor broadcast skipped: %s", exc
+                )
+            else:
+                proposals, proposal_logprobs = unpack_pearl_proposal_logprobs(
+                    req_ids,
+                    packed_tokens,
+                    packed_logprob_token_ids,
+                    packed_logprobs,
+                    packed_ranks,
+                )
+                return proposals, proposal_logprobs
+        try:
+            obj = [
+                {"tokens": proposals, "logprobs": proposal_logprobs},
+            ]
+            if should_broadcast_verify:
+                torch.distributed.broadcast_object_list(
+                    obj,
+                    src=role.draft_ranks[0],
+                    group=self.pearl_groups.verify_group,
+                )
+            if should_broadcast_draft:
+                torch.distributed.broadcast_object_list(
+                    obj,
+                    src=role.draft_ranks[0],
+                    group=self.pearl_groups.draft_group,
+                )
+            payload = obj[0]
+            proposals = payload.get("tokens", {})
+            proposal_logprobs = payload.get("logprobs")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("PEARL proposal broadcast skipped: %s", exc)
+        self._pearl_barrier()
+        return proposals, proposal_logprobs
+
+    def _pearl_sync_verification_result(
+        self, result: dict[str, dict[str, int | bool]]
+    ) -> dict[str, dict[str, int | bool]]:
+        """Broadcast verification result over the verify subgroup (best-effort)."""
+        if self.pearl_groups is None or self.pearl_groups.verify_group is None:
+            return result
+        role = self.pearl_groups.role
+        try:
+            if not role.is_draft or role.local_rank == 0:
+                obj = [result]
+                torch.distributed.broadcast_object_list(
+                    obj,
+                    src=role.target_ranks[0],
+                    group=self.pearl_groups.verify_group,
+                )
+                result = obj[0]
+            if role.is_draft and self.pearl_groups.draft_group is not None:
+                obj = [result]
+                torch.distributed.broadcast_object_list(
+                    obj,
+                    src=role.draft_ranks[0],
+                    group=self.pearl_groups.draft_group,
+                )
+                result = obj[0]
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("PEARL verification broadcast skipped: %s", exc)
+        return result
+
+    def _pearl_build_scheduler_output(
+        self,
+        scheduler_output: "SchedulerOutput",
+        proposals: dict[str, list[int]],
+    ) -> "SchedulerOutput":
+        """Return a shallow copy of scheduler_output with spec decode tokens."""
+        num_sched_tokens = dict(scheduler_output.num_scheduled_tokens)
+        for req_id, tokens in proposals.items():
+            if req_id not in num_sched_tokens:
+                continue
+            num_sched_tokens[req_id] = num_sched_tokens[req_id] + len(tokens)
+        total_sched = sum(num_sched_tokens.values())
+        return SchedulerOutput(
+            scheduled_new_reqs=scheduler_output.scheduled_new_reqs,
+            scheduled_cached_reqs=scheduler_output.scheduled_cached_reqs,
+            num_scheduled_tokens=num_sched_tokens,
+            total_num_scheduled_tokens=total_sched,
+            scheduled_spec_decode_tokens=proposals,
+            scheduled_encoder_inputs=scheduler_output.scheduled_encoder_inputs,
+            num_common_prefix_blocks=scheduler_output.num_common_prefix_blocks,
+            finished_req_ids=scheduler_output.finished_req_ids,
+            free_encoder_mm_hashes=scheduler_output.free_encoder_mm_hashes,
+            preempted_req_ids=scheduler_output.preempted_req_ids,
+            pending_structured_output_tokens=(
+                scheduler_output.pending_structured_output_tokens
+            ),
+            kv_connector_metadata=scheduler_output.kv_connector_metadata,
+            ec_connector_metadata=scheduler_output.ec_connector_metadata,
+        )
+
+    def _pearl_build_verify_result(
+        self,
+        scheduler_output: "SchedulerOutput",
+        req_ids: list[str],
+        sampled_token_ids: list[list[int]],
+    ) -> dict[str, dict[str, int | bool]]:
+        result: dict[str, dict[str, int | bool]] = {}
+        for req_id, sampled in zip(req_ids, sampled_token_ids):
+            draft_tokens = scheduler_output.scheduled_spec_decode_tokens.get(
+                req_id, []
+            )
+            if not draft_tokens:
+                result[req_id] = {
+                    "acc": True,
+                    "rollout": 0,
+                    "revise": -1,
+                    "finish": False,
+                }
+                continue
+            if sampled == draft_tokens:
+                result[req_id] = {
+                    "acc": True,
+                    "rollout": 0,
+                    "revise": -1,
+                    "finish": False,
+                }
+                continue
+            mismatch_idx = None
+            min_len = min(len(sampled), len(draft_tokens))
+            for i in range(min_len):
+                if sampled[i] != draft_tokens[i]:
+                    mismatch_idx = i
+                    break
+            if mismatch_idx is None:
+                mismatch_idx = max(min_len - 1, 0)
+            revise = sampled[mismatch_idx] if sampled else -1
+            rollout = len(draft_tokens) - mismatch_idx
+            result[req_id] = {
+                "acc": False,
+                "rollout": int(rollout),
+                "revise": int(revise),
+                "finish": False,
+            }
+        return result
+
+    def _pearl_expected_output_shape(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> tuple[int, int]:
+        num_reqs = len(self.input_batch.req_ids)
+        max_spec_len = 0
+        if scheduler_output.scheduled_spec_decode_tokens:
+            max_spec_len = max(
+                len(tokens)
+                for tokens in scheduler_output.scheduled_spec_decode_tokens.values()
+            )
+        return num_reqs, max_spec_len + 1
+
+    def _pearl_sync_output_tensor(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampled_token_ids: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if self.pearl_groups is None or self.pearl_groups.verify_group is None:
+            return sampled_token_ids
+        role = self.pearl_groups.role
+        expected_shape = self._pearl_expected_output_shape(scheduler_output)
+        if sampled_token_ids is None:
+            sampled_token_ids = torch.empty(
+                expected_shape, device=self.device, dtype=torch.int32
+            )
+        else:
+            sampled_token_ids = sampled_token_ids.to(dtype=torch.int32)
+            if sampled_token_ids.shape != expected_shape:
+                padded = torch.full(
+                    expected_shape,
+                    PLACEHOLDER_TOKEN_ID,
+                    device=sampled_token_ids.device,
+                    dtype=sampled_token_ids.dtype,
+                )
+                rows = min(expected_shape[0], sampled_token_ids.shape[0])
+                cols = min(expected_shape[1], sampled_token_ids.shape[1])
+                padded[:rows, :cols] = sampled_token_ids[:rows, :cols]
+                sampled_token_ids = padded
+        try:
+            if not role.is_draft or role.local_rank == 0:
+                torch.distributed.broadcast(
+                    sampled_token_ids,
+                    src=role.target_ranks[0],
+                    group=self.pearl_groups.verify_group,
+                )
+            if role.is_draft and self.pearl_groups.draft_group is not None:
+                torch.distributed.broadcast(
+                    sampled_token_ids,
+                    src=role.draft_ranks[0],
+                    group=self.pearl_groups.draft_group,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("PEARL output tensor broadcast skipped: %s", exc)
+        self._pearl_barrier()
+        return sampled_token_ids
+
+    def _pearl_sync_verification_tensors(
+        self,
+        acc_tensor: torch.Tensor | None,
+        rollout_tensor: torch.Tensor | None,
+        revise_tensor: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.pearl_groups is None or self.pearl_groups.verify_group is None:
+            assert acc_tensor is not None
+            assert rollout_tensor is not None
+            assert revise_tensor is not None
+            return acc_tensor, rollout_tensor, revise_tensor
+        role = self.pearl_groups.role
+        num_reqs = len(self.input_batch.req_ids)
+        if acc_tensor is None:
+            acc_tensor = torch.zeros(num_reqs, device=self.device, dtype=torch.int32)
+        if rollout_tensor is None:
+            rollout_tensor = torch.zeros(
+                num_reqs, device=self.device, dtype=torch.int32
+            )
+        if revise_tensor is None:
+            revise_tensor = torch.full(
+                (num_reqs,),
+                -1,
+                device=self.device,
+                dtype=torch.int32,
+            )
+        try:
+            if not role.is_draft or role.local_rank == 0:
+                torch.distributed.broadcast(
+                    acc_tensor,
+                    src=role.target_ranks[0],
+                    group=self.pearl_groups.verify_group,
+                )
+                torch.distributed.broadcast(
+                    rollout_tensor,
+                    src=role.target_ranks[0],
+                    group=self.pearl_groups.verify_group,
+                )
+                torch.distributed.broadcast(
+                    revise_tensor,
+                    src=role.target_ranks[0],
+                    group=self.pearl_groups.verify_group,
+                )
+            if role.is_draft and self.pearl_groups.draft_group is not None:
+                torch.distributed.broadcast(
+                    acc_tensor,
+                    src=role.draft_ranks[0],
+                    group=self.pearl_groups.draft_group,
+                )
+                torch.distributed.broadcast(
+                    rollout_tensor,
+                    src=role.draft_ranks[0],
+                    group=self.pearl_groups.draft_group,
+                )
+                torch.distributed.broadcast(
+                    revise_tensor,
+                    src=role.draft_ranks[0],
+                    group=self.pearl_groups.draft_group,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("PEARL verification tensor broadcast skipped: %s", exc)
+        self._pearl_barrier()
+        return acc_tensor, rollout_tensor, revise_tensor
+
+    def _pearl_barrier(self) -> None:
+        if self.speculative_config is None:
+            return
+        if self.speculative_config.method != "pearl":
+            return
+        if self.parallel_config.pipeline_parallel_size > 1:
+            torch.distributed.barrier(group=get_pp_group().device_group)
+        if self.parallel_config.data_parallel_size > 1:
+            torch.distributed.barrier(group=get_dp_group().device_group)
+
+    def _pearl_sync_pp_sampler_output(
+        self,
+        sampler_output: SamplerOutput,
+        acc_tensor: torch.Tensor | None,
+        rollout_tensor: torch.Tensor | None,
+        revise_tensor: torch.Tensor | None,
+    ) -> tuple[SamplerOutput, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        if not self.broadcast_pp_output:
+            return sampler_output, acc_tensor, rollout_tensor, revise_tensor
+        if self.parallel_config.pipeline_parallel_size <= 1:
+            return sampler_output, acc_tensor, rollout_tensor, revise_tensor
+        pp_group = get_pp_group()
+        src = pp_group.world_size - 1
+        payload: dict[str, torch.Tensor] = {
+            "sampled_token_ids": sampler_output.sampled_token_ids,
+        }
+        if sampler_output.logprobs_tensors is not None:
+            payload["logprob_token_ids"] = (
+                sampler_output.logprobs_tensors.logprob_token_ids
+            )
+            payload["logprobs"] = sampler_output.logprobs_tensors.logprobs
+            payload["selected_token_ranks"] = (
+                sampler_output.logprobs_tensors.selected_token_ranks
+            )
+        if acc_tensor is not None:
+            payload["acc_tensor"] = acc_tensor
+        if rollout_tensor is not None:
+            payload["rollout_tensor"] = rollout_tensor
+        if revise_tensor is not None:
+            payload["revise_tensor"] = revise_tensor
+
+        broadcasted = pp_group.broadcast_tensor_dict(payload, src=src)
+        if broadcasted is None:
+            return sampler_output, acc_tensor, rollout_tensor, revise_tensor
+        if pp_group.rank_in_group != src:
+            sampler_output.sampled_token_ids = broadcasted["sampled_token_ids"]
+            if "logprob_token_ids" in broadcasted:
+                sampler_output.logprobs_tensors = LogprobsTensors(
+                    logprob_token_ids=broadcasted["logprob_token_ids"],
+                    logprobs=broadcasted["logprobs"],
+                    selected_token_ranks=broadcasted["selected_token_ranks"],
+                )
+            else:
+                sampler_output.logprobs_tensors = None
+            acc_tensor = broadcasted.get("acc_tensor")
+            rollout_tensor = broadcasted.get("rollout_tensor")
+            revise_tensor = broadcasted.get("revise_tensor")
+        return sampler_output, acc_tensor, rollout_tensor, revise_tensor
+
+    def _pearl_get_gamma(self) -> int:
+        """Resolve the PEARL draft window length."""
+        spec_cfg = self.speculative_config
+        if spec_cfg is None:
+            return 0
+        if spec_cfg.pearl_gamma and spec_cfg.pearl_gamma > 0:
+            return int(spec_cfg.pearl_gamma)
+        if (
+            spec_cfg.method == "pearl"
+            and spec_cfg.pearl_auto_gamma
+            and (spec_cfg.pearl_gamma is None or spec_cfg.pearl_gamma <= 0)
+            and (self.num_spec_tokens or 0) <= 1
+        ):
+            logger.warning_once(
+                "PEARL auto-gamma is enabled but num_speculative_tokens=%d; "
+                "gamma will be capped to 1. Increase num_speculative_tokens to "
+                "allow larger gamma.",
+                int(self.num_spec_tokens or 0),
+            )
+        max_gamma = max(int(self.num_spec_tokens or 0), 1)
+        batch_size = (
+            len(self.input_batch.req_ids)
+            if self.input_batch is not None
+            else 0
+        )
+        if spec_cfg.pearl_auto_gamma:
+            bucket = self._pearl_gamma_bucket(batch_size)
+            if bucket in self.pearl_auto_gamma_table:
+                return min(self.pearl_auto_gamma_table[bucket], max_gamma)
+            if self.pearl_auto_gamma_value is not None:
+                return min(int(self.pearl_auto_gamma_value), max_gamma)
+        if self.pearl_auto_gamma_value is not None:
+            return min(int(self.pearl_auto_gamma_value), max_gamma)
+        return max_gamma
+
+    def _pearl_gamma_bucket(self, batch_size: int) -> int:
+        if batch_size <= 0:
+            return self.pearl_auto_gamma_bins[0]
+        for bucket in self.pearl_auto_gamma_bins:
+            if batch_size <= bucket:
+                return bucket
+        return self.pearl_auto_gamma_bins[-1]
+
+    @staticmethod
+    def _pearl_compute_auto_gamma(
+        draft_time: float,
+        draft_tokens: float,
+        target_time: float,
+        target_tokens: float,
+        max_gamma: int,
+    ) -> int | None:
+        if max_gamma <= 0:
+            return None
+        if draft_time <= 0 or target_time <= 0:
+            return None
+        if draft_tokens <= 0 or target_tokens <= 0:
+            return None
+        draft_tps = draft_tokens / draft_time
+        target_tps = target_tokens / target_time
+        if target_tps <= 0:
+            return None
+        gamma = int(round(draft_tps / target_tps))
+        gamma = max(1, min(max_gamma, gamma))
+        return gamma
+
+    def _pearl_auto_gamma_enabled(self) -> bool:
+        spec_cfg = self.speculative_config
+        if spec_cfg is None:
+            return False
+        return (
+            spec_cfg.method == "pearl"
+            and spec_cfg.pearl_auto_gamma
+            and (spec_cfg.pearl_gamma is None or spec_cfg.pearl_gamma <= 0)
+        )
+
+    def _pearl_record_draft_profile(
+        self, draft_tokens: int, elapsed: float, batch_size: int
+    ) -> None:
+        if not self._pearl_auto_gamma_enabled():
+            return
+        if draft_tokens <= 0 or elapsed <= 0:
+            return
+        self.pearl_last_draft_tokens = int(draft_tokens)
+        self.pearl_last_draft_time = float(elapsed)
+        self.pearl_last_batch_size = int(batch_size)
+
+    def _pearl_record_target_profile(
+        self, target_tokens: int, elapsed: float, batch_size: int
+    ) -> None:
+        if not self._pearl_auto_gamma_enabled():
+            return
+        if target_tokens <= 0 or elapsed <= 0:
+            return
+        self.pearl_last_target_tokens = int(target_tokens)
+        self.pearl_last_target_time = float(elapsed)
+        self.pearl_last_batch_size = int(batch_size)
+
+    def _pearl_broadcast_auto_gamma(self) -> None:
+        if self.pearl_groups is None or self.pearl_groups.draft_group is None:
+            return
+        role = self.pearl_groups.role
+        if not role.is_draft:
+            return
+        gamma_value = int(self.pearl_auto_gamma_value or 0)
+        gamma_tensor = torch.tensor(
+            [gamma_value], device=self.device, dtype=torch.int32
+        )
+        try:
+            torch.distributed.broadcast(
+                gamma_tensor,
+                src=role.draft_ranks[0],
+                group=self.pearl_groups.draft_group,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("PEARL auto-gamma broadcast skipped: %s", exc)
+            return
+        if role.local_rank != 0 and gamma_tensor.item() > 0:
+            self.pearl_auto_gamma_value = int(gamma_tensor.item())
+            batch_size = (
+                len(self.input_batch.req_ids)
+                if self.input_batch is not None
+                else self.pearl_last_batch_size
+            )
+            bucket = self._pearl_gamma_bucket(batch_size)
+            self.pearl_auto_gamma_table[bucket] = int(gamma_tensor.item())
+
+    def _pearl_maybe_autotune_gamma(self) -> None:
+        if not self._pearl_auto_gamma_enabled():
+            return
+        if self.pearl_groups is None or self.pearl_groups.verify_group is None:
+            return
+        role = self.pearl_groups.role
+        if role.is_draft and role.local_rank != 0:
+            self._pearl_broadcast_auto_gamma()
+            return
+        if self.pearl_auto_gamma_value is not None and role.is_draft:
+            self._pearl_broadcast_auto_gamma()
+
+        batch_size = self.pearl_last_batch_size
+        if batch_size <= 0 and self.input_batch is not None:
+            batch_size = len(self.input_batch.req_ids)
+        bucket = self._pearl_gamma_bucket(batch_size)
+
+        metrics = torch.zeros(4, device=self.device, dtype=torch.float32)
+        if role.is_draft and role.local_rank == 0:
+            metrics[0] = float(self.pearl_last_draft_time)
+            metrics[1] = float(self.pearl_last_draft_tokens)
+        if (not role.is_draft) and role.local_rank == 0:
+            metrics[2] = float(self.pearl_last_target_time)
+            metrics[3] = float(self.pearl_last_target_tokens)
+        torch.distributed.all_reduce(metrics, group=self.pearl_groups.verify_group)
+        self.pearl_last_draft_time = 0.0
+        self.pearl_last_target_time = 0.0
+        self.pearl_last_draft_tokens = 0
+        self.pearl_last_target_tokens = 0
+        self.pearl_last_batch_size = 0
+
+        draft_time, draft_tokens, target_time, target_tokens = metrics.tolist()
+        if draft_time <= 0 or target_time <= 0:
+            if role.is_draft:
+                self._pearl_broadcast_auto_gamma()
+            return
+        if draft_tokens <= 0 or target_tokens <= 0:
+            if role.is_draft:
+                self._pearl_broadcast_auto_gamma()
+            return
+
+        stats = self.pearl_auto_gamma_stats.setdefault(
+            bucket,
+            {
+                "samples": 0.0,
+                "draft_time": 0.0,
+                "draft_tokens": 0.0,
+                "target_time": 0.0,
+                "target_tokens": 0.0,
+            },
+        )
+        stats["samples"] += 1.0
+        stats["draft_time"] += float(draft_time)
+        stats["draft_tokens"] += float(draft_tokens)
+        stats["target_time"] += float(target_time)
+        stats["target_tokens"] += float(target_tokens)
+
+        if stats["samples"] >= self.pearl_auto_gamma_min_samples:
+            max_gamma = max(int(self.num_spec_tokens or 0), 1)
+            gamma = self._pearl_compute_auto_gamma(
+                draft_time=stats["draft_time"],
+                draft_tokens=stats["draft_tokens"],
+                target_time=stats["target_time"],
+                target_tokens=stats["target_tokens"],
+                max_gamma=max_gamma,
+            )
+            if gamma is not None:
+                self.pearl_auto_gamma_table[bucket] = int(gamma)
+                self.pearl_auto_gamma_value = int(gamma)
+                if (not role.is_draft) and role.local_rank == 0:
+                    logger.info_once(
+                        "PEARL auto-gamma selected gamma=%d for bucket=%d "
+                        "(draft_tps=%.2f, target_tps=%.2f).",
+                        gamma,
+                        bucket,
+                        stats["draft_tokens"] / stats["draft_time"],
+                        stats["target_tokens"] / stats["target_time"],
+                    )
+        if role.is_draft:
+            self._pearl_broadcast_auto_gamma()
+
+    def _pearl_update_pre_verify_from_result(
+        self, req_ids: list[str], acc_flags: list[bool]
+    ) -> None:
+        for req_id, acc in zip(req_ids, acc_flags):
+            self.pearl_pre_verify[req_id] = not acc
+
+    def _pearl_make_placeholder_proposals(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> dict[str, list[int]]:
+        """Generate a simple placeholder proposal per request (last token repeat)."""
+        proposals: dict[str, list[int]] = {}
+        num_spec_tokens = self._pearl_get_gamma()
+        for req_id in scheduler_output.num_scheduled_tokens:
+            req_idx = self.input_batch.req_id_to_index.get(req_id)
+            if req_idx is None:
+                continue
+            num_tokens = self.input_batch.num_tokens_no_spec[req_idx]
+            if num_tokens == 0:
+                continue
+            last_token = int(self.input_batch.token_ids_cpu[req_idx, num_tokens - 1])
+            proposals[req_id] = [last_token] * num_spec_tokens
+        return proposals
+
+    def _pearl_record_freed_blocks(self, block_ids: list[int]) -> None:
+        """Collect freed block ids for future scheduler-side release."""
+        if not block_ids:
+            return
+        for block_id in block_ids:
+            if block_id is None:
+                continue
+            if block_id < 0:
+                continue
+            self.pearl_freed_block_ids.append(int(block_id))
+
+    def _pearl_apply_rollbacks_from_verify(
+        self,
+        scheduler_output: "SchedulerOutput",
+        req_ids: list[str],
+        rollouts: list[int],
+    ) -> None:
+        if self.speculative_config is None:
+            return
+        if self.speculative_config.method != "pearl":
+            return
+        if not scheduler_output.scheduled_spec_decode_tokens:
+            return
+        for req_id, rollout in zip(req_ids, rollouts):
+            if rollout <= 0:
+                continue
+            draft_tokens = scheduler_output.scheduled_spec_decode_tokens.get(
+                req_id, []
+            )
+            if not draft_tokens:
+                continue
+            req_idx = self.input_batch.req_id_to_index.get(req_id)
+            if req_idx is None:
+                continue
+            base_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+            num_accepted = max(len(draft_tokens) - int(rollout), 0)
+            new_tokens = base_computed + num_accepted
+            self.input_batch.block_table.rollback_row_to_num_tokens(
+                req_idx, new_tokens
+            )
+
+    def _pearl_apply_rollbacks(
+        self,
+        scheduler_output: "SchedulerOutput",
+        valid_sampled_token_ids: list[list[int]],
+        req_id_to_index: dict[str, int],
+    ) -> None:
+        """Rollback trailing KV blocks based on rejected draft tokens."""
+        if self.speculative_config is None:
+            return
+        if self.speculative_config.method != "pearl":
+            return
+        if not scheduler_output.scheduled_spec_decode_tokens:
+            return
+        for req_id, draft_tokens in scheduler_output.scheduled_spec_decode_tokens.items():
+            if not draft_tokens:
+                continue
+            req_idx = self.input_batch.req_id_to_index.get(req_id)
+            if req_idx is None:
+                continue
+            output_idx = req_id_to_index.get(req_id)
+            if output_idx is None:
+                continue
+            valid_tokens = valid_sampled_token_ids[output_idx]
+            if not valid_tokens:
+                continue
+            if valid_tokens == draft_tokens:
+                num_accepted = len(draft_tokens)
+            else:
+                num_accepted = max(len(valid_tokens) - 1, 0)
+            num_rejected = len(draft_tokens) - num_accepted
+            if num_rejected <= 0:
+                continue
+            current_tokens = int(self.input_batch.num_tokens[req_idx])
+            new_tokens = max(current_tokens - num_rejected, 0)
+            self.input_batch.block_table.rollback_row_to_num_tokens(
+                req_idx, new_tokens
+            )
+
+    def _pearl_update_pre_verify(
+        self,
+        scheduler_output: "SchedulerOutput",
+        valid_sampled_token_ids: list[list[int]],
+        req_ids: list[str],
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        if self.speculative_config is None:
+            return
+        if self.speculative_config.method != "pearl":
+            return
+        if spec_decode_metadata is None:
+            return
+        for req_id, num_draft, sampled in zip(
+            req_ids, spec_decode_metadata.num_draft_tokens, valid_sampled_token_ids
+        ):
+            if num_draft <= 0:
+                continue
+            draft_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
+            accepted = bool(draft_tokens) and sampled == draft_tokens
+            self.pearl_pre_verify[req_id] = not accepted
+
+    def _pearl_prepare_draft_token_ids(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> list[list[int]]:
+        proposals, _ = self._pearl_collect_draft_proposals(scheduler_output)
+        return [proposals.get(req_id, []) for req_id in self.input_batch.req_ids]
+
+    def _pearl_take_pending_proposals(self) -> dict[str, list[int]] | None:
+        proposals = self.pearl_pending_proposals
+        self.pearl_pending_proposals = None
+        return proposals
+
+    def _pearl_take_pending_proposal_logprobs(
+        self,
+    ) -> dict[str, list[tuple[np.ndarray, np.ndarray, int | None]]] | None:
+        proposal_logprobs = self.pearl_pending_proposal_logprobs
+        self.pearl_pending_proposal_logprobs = None
+        return proposal_logprobs
+
+    def _pearl_apply_sampled_tokens(
+        self,
+        req_ids: list[str],
+        sampled_token_ids: list[list[int]],
+    ) -> None:
+        for req_idx, sampled_ids in enumerate(sampled_token_ids):
+            if not sampled_ids:
+                continue
+            start_idx = int(self.input_batch.num_tokens_no_spec[req_idx])
+            end_idx = start_idx + len(sampled_ids)
+            assert end_idx <= self.max_model_len, (
+                "Sampled token IDs exceed the max model length. "
+                f"Total number of tokens: {end_idx} > max_model_len: "
+                f"{self.max_model_len}"
+            )
+            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
+            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
+            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+            self.input_batch.num_tokens[req_idx] = end_idx
+            req_id = req_ids[req_idx]
+            if req_id in self.requests:
+                self.requests[req_id].output_token_ids.extend(sampled_ids)
+
+    def _pearl_sync_and_apply_output_tokens(self) -> None:
+        if self.pearl_groups is None or not self.pearl_groups.role.is_draft:
+            return
+        scheduler_output = self.pearl_last_scheduler_output
+        self.pearl_last_scheduler_output = None
+        if scheduler_output is None:
+            return
+        req_ids = self.input_batch.req_ids
+        if not req_ids:
+            return
+        sampled_tensor = self._pearl_sync_output_tensor(scheduler_output, None)
+        if sampled_tensor is None:
+            return
+        sampled_token_ids, _ = RejectionSampler.parse_output(
+            sampled_tensor,
+            self.input_batch.vocab_size,
+        )
+        acc_tensor, rollout_tensor, revise_tensor = (
+            self._pearl_sync_verification_tensors(None, None, None)
+        )
+        rollouts = rollout_tensor.tolist()
+        verify_result = {
+            req_id: {
+                "acc": bool(acc_tensor[i].item()),
+                "rollout": int(rollouts[i]),
+                "revise": int(revise_tensor[i].item()),
+                "finish": False,
+            }
+            for i, req_id in enumerate(req_ids)
+        }
+        self.pearl_pending_verification = verify_result
+        self._pearl_update_pre_verify_from_result(
+            req_ids, [bool(x) for x in acc_tensor.tolist()]
+        )
+        self._pearl_apply_sampled_tokens(req_ids, sampled_token_ids)
+        self._pearl_apply_rollbacks_from_verify(
+            scheduler_output, req_ids, rollouts
+        )
+        pending_proposals = self._pearl_take_pending_proposals()
+        self._pearl_take_pending_proposal_logprobs()
+        if pending_proposals is not None:
+            self._draft_token_ids = [
+                pending_proposals.get(req_id, []) for req_id in req_ids
+            ]
+        # Draft ranks don't emit ModelRunnerOutput, so drop freed ids.
+        self.pearl_freed_block_ids = []
+
+    def _pearl_sync_output_tokens(
+        self,
+        req_ids: list[str],
+        sampled_token_ids: list[list[int]],
+    ) -> list[list[int]]:
+        """Synchronize output tokens across the PEARL verify subgroup."""
+        if self.pearl_groups is None or self.pearl_groups.verify_group is None:
+            return sampled_token_ids
+        role = self.pearl_groups.role
+        payload = {req_id: toks for req_id, toks in zip(req_ids, sampled_token_ids)}
+        try:
+            if not role.is_draft or role.local_rank == 0:
+                obj = [payload]
+                torch.distributed.broadcast_object_list(
+                    obj,
+                    src=role.target_ranks[0],
+                    group=self.pearl_groups.verify_group,
+                )
+                payload = obj[0]
+            if role.is_draft and self.pearl_groups.draft_group is not None:
+                obj = [payload]
+                torch.distributed.broadcast_object_list(
+                    obj,
+                    src=role.draft_ranks[0],
+                    group=self.pearl_groups.draft_group,
+                )
+                payload = obj[0]
+            return [payload.get(req_id, []) for req_id in req_ids]
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("PEARL output broadcast skipped: %s", exc)
+        return sampled_token_ids
+
+    def _pearl_pp_recv(
+        self,
+        intermediate_tensors: IntermediateTensors | None,
+        all_gather_tensors: dict[str, bool],
+    ) -> IntermediateTensors | None:
+        if self.parallel_config.pipeline_parallel_size <= 1:
+            return intermediate_tensors
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank or intermediate_tensors is not None:
+            return intermediate_tensors
+        tensor_dict = pp_group.recv_tensor_dict(
+            all_gather_group=get_tp_group(),
+            all_gather_tensors=all_gather_tensors,
+        )
+        assert tensor_dict is not None
+        return IntermediateTensors(tensor_dict)
+
+    def _pearl_pp_send(
+        self,
+        output: IntermediateTensors | None,
+        all_gather_tensors: dict[str, bool],
+    ) -> None:
+        if self.parallel_config.pipeline_parallel_size <= 1:
+            return
+        if self.broadcast_pp_output:
+            return
+        if output is None or not isinstance(output, IntermediateTensors):
+            return
+        pp_group = get_pp_group()
+        if pp_group.is_last_rank:
+            return
+        pp_group.send_tensor_dict(
+            output.tensors,
+            all_gather_group=get_tp_group(),
+            all_gather_tensors=all_gather_tensors,
+        )
+
+    def _pearl_collect_draft_proposals(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> tuple[
+        dict[str, list[int]],
+        dict[str, list[tuple[np.ndarray, np.ndarray, int | None]]] | None,
+    ]:
+        """Run a draft forward pass and rollback any state mutations."""
+        if (
+            self.pearl_groups is not None
+            and get_tp_group().world_size > 1
+            and self.pearl_tp_group is None
+        ):
+            raise RuntimeError(
+                "PEARL draft proposals require split TP groups when TP>1."
+            )
+        if self.pearl_draft_model is None and self.model is None:
+            return {}
+        gamma = self._pearl_get_gamma()
+        if gamma <= 0:
+            return {}
+        profile_start = (
+            time.perf_counter() if self._pearl_auto_gamma_enabled() else None
+        )
+
+        # Snapshot minimal mutable state before running the draft forward.
+        block_table = self.input_batch.block_table
+        block_table_snapshot = block_table.get_num_blocks_per_row_snapshot()
+        requests_snapshot = deepcopy(self.requests)
+        tokens_snapshot: dict[str, np.ndarray] = {}
+        counters_snapshot: dict[str, tuple[int, int, int]] = {}
+        for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+            if num_tokens <= 0:
+                continue
+            req_idx = self.input_batch.req_id_to_index.get(req_id)
+            if req_idx is None:
+                continue
+            counters_snapshot[req_id] = (
+                int(self.input_batch.num_tokens[req_idx]),
+                int(self.input_batch.num_tokens_no_spec[req_idx]),
+                int(self.input_batch.num_computed_tokens_cpu[req_idx]),
+            )
+            cur_len = counters_snapshot[req_id][0]
+            tokens_snapshot[req_id] = self.input_batch.token_ids_cpu[
+                req_idx, :cur_len
+            ].copy()
+
+        proposals: dict[str, list[int]] = {}
+        proposal_logprobs: dict[
+            str, list[tuple[np.ndarray, np.ndarray, int | None]]
+        ] | None = None
+        if self.input_batch.sampling_metadata.max_num_logprobs is not None:
+            proposal_logprobs = {}
+        pp_intermediate_tensors = intermediate_tensors
+        all_gather_tensors: dict[str, bool] = {}
+        if (
+            self.parallel_config.pipeline_parallel_size > 1
+            and self.compilation_config.pass_config.enable_sp
+        ):
+            num_tokens = scheduler_output.total_num_scheduled_tokens
+            if num_tokens > 0:
+                num_scheduled_tokens_np = np.array(
+                    list(scheduler_output.num_scheduled_tokens.values()),
+                    dtype=np.int32,
+                )
+                if num_scheduled_tokens_np.size:
+                    _, batch_desc, _, _, _ = (
+                        self._determine_batch_execution_and_padding(
+                            num_tokens=num_tokens,
+                            num_reqs=len(num_scheduled_tokens_np),
+                            num_scheduled_tokens_np=num_scheduled_tokens_np,
+                            max_num_scheduled_tokens=int(
+                                num_scheduled_tokens_np.max()
+                            ),
+                            use_cascade_attn=False,
+                        )
+                    )
+                    all_gather_tensors = {
+                        "residual": not is_residual_scattered_for_sp(
+                            self.vllm_config, batch_desc.num_tokens
+                        )
+                    }
+
+        self.pearl_in_draft = True
+        try:
+            for _ in range(gamma):
+                pp_intermediate_tensors = self._pearl_pp_recv(
+                    pp_intermediate_tensors, all_gather_tensors
+                )
+                if self.pearl_tp_group is None:
+                    draft_out = self._execute_model_body(
+                        scheduler_output,
+                        intermediate_tensors=pp_intermediate_tensors,
+                        model_override=self.pearl_draft_model or self.model,
+                        skip_update_states=True,
+                    )
+                else:
+                    with patch_tensor_parallel_group(self.pearl_tp_group):
+                        draft_out = self._execute_model_body(
+                            scheduler_output,
+                            intermediate_tensors=pp_intermediate_tensors,
+                            model_override=self.pearl_draft_model or self.model,
+                            skip_update_states=True,
+                        )
+                pp_intermediate_tensors = None
+                if isinstance(draft_out, IntermediateTensors):
+                    self._pearl_pp_send(draft_out, all_gather_tensors)
+                    continue
+                if draft_out is None:
+                    draft_out = self.sample_tokens(None)
+                if isinstance(draft_out, AsyncModelRunnerOutput):
+                    draft_out = draft_out.get_output()
+                if isinstance(draft_out, ModelRunnerOutput):
+                    for req_id in draft_out.req_ids:
+                        idx = draft_out.req_id_to_index[req_id]
+                        tokens = list(draft_out.sampled_token_ids[idx])
+                        if not tokens:
+                            continue
+                        proposals.setdefault(req_id, []).append(tokens[-1])
+                        if proposal_logprobs is None:
+                            continue
+                        if draft_out.logprobs is None:
+                            continue
+                        logprobs_slice = draft_out.logprobs.slice_request(
+                            idx, len(tokens)
+                        )
+                        row_idx = max(len(tokens) - 1, 0)
+                        logprob_token_ids = logprobs_slice.logprob_token_ids[
+                            row_idx
+                        ].copy()
+                        logprobs = logprobs_slice.logprobs[row_idx].copy()
+                        token_ranks = logprobs_slice.sampled_token_ranks
+                        rank_value: int | None = None
+                        if token_ranks.size:
+                            rank_value = int(token_ranks[row_idx])
+                        proposal_logprobs.setdefault(req_id, []).append(
+                            (logprob_token_ids, logprobs, rank_value)
+                        )
+        finally:
+            self.pearl_in_draft = False
+            # Rollback token/state buffers.
+            for req_id, (num_tok, num_tok_no_spec, num_comp) in counters_snapshot.items():
+                req_idx = self.input_batch.req_id_to_index.get(req_id)
+                if req_idx is None:
+                    continue
+                self.input_batch.num_tokens[req_idx] = num_tok
+                self.input_batch.num_tokens_no_spec[req_idx] = num_tok_no_spec
+                self.input_batch.num_computed_tokens_cpu[req_idx] = num_comp
+                self.input_batch.token_ids_cpu[req_idx].fill(0)
+                restored = tokens_snapshot[req_id]
+                if restored.size > 0:
+                    self.input_batch.token_ids_cpu[
+                        req_idx, : restored.shape[0]
+                    ] = restored
+            # Rollback block table rows.
+            block_table.rollback_to_num_blocks_snapshot(block_table_snapshot)
+            # Restore request bookkeeping and clear draft tokens.
+            self.requests = requests_snapshot
+            self._draft_token_ids = None
+            self.input_batch.prev_sampled_token_ids = None
+            self.input_batch.refresh_metadata()
+
+        # Fall back to placeholders if the draft model produced nothing.
+        if not proposals:
+            proposals = self._pearl_make_placeholder_proposals(scheduler_output)
+            proposal_logprobs = None
+        if profile_start is not None:
+            draft_tokens = sum(len(tokens) for tokens in proposals.values())
+            elapsed = time.perf_counter() - profile_start
+            self._pearl_record_draft_profile(
+                draft_tokens,
+                elapsed,
+                len(self.input_batch.req_ids) if self.input_batch is not None else 0,
+            )
+        return proposals, proposal_logprobs
+
+    def _execute_model_body(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None = None,
+        model_override: torch.nn.Module | None = None,
+        skip_update_states: bool = False,
+    ) -> ModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -2934,7 +4632,8 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
-                self._update_states(scheduler_output)
+                if not skip_update_states:
+                    self._update_states(scheduler_output)
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -3007,6 +4706,7 @@ class GPUModelRunner(
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
+                    force_eager=self.pearl_in_draft,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 
@@ -3089,6 +4789,7 @@ class GPUModelRunner(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
+                model_override=model_override,
                 **model_kwargs,
             )
 
@@ -3101,6 +4802,7 @@ class GPUModelRunner(
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            logits_model = model_override or self.model
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -3119,7 +4821,7 @@ class GPUModelRunner(
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                logits = logits_model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -3138,7 +4840,7 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    logits = logits_model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -3172,18 +4874,25 @@ class GPUModelRunner(
         self.kv_connector_output = None
 
         if self.execute_model_state is None:
-            # Nothing to do (PP non-final rank case), output isn't used.
-            if not kv_connector_output:
-                return None  # type: ignore[return-value]
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "pearl"
+                and self.pearl_groups is not None
+                and self.pearl_groups.role.is_draft
+            ):
+                self._pearl_sync_and_apply_output_tokens()
+                # Nothing to do (PP non-final rank case), output isn't used.
+                if not kv_connector_output:
+                    return None  # type: ignore[return-value]
 
-            # In case of PP with kv transfer, we need to pass through the
-            # kv_connector_output
-            if kv_connector_output.is_empty():
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                # In case of PP with kv transfer, we need to pass through the
+                # kv_connector_output
+                if kv_connector_output.is_empty():
+                    return EMPTY_MODEL_RUNNER_OUTPUT
 
-            output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
-            output.kv_connector_output = kv_connector_output
-            return output
+                output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+                output.kv_connector_output = kv_connector_output
+                return output
 
         # Unpack ephemeral state.
         (
@@ -3207,7 +4916,38 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            pearl_verify_result = None
+            acc_tensor = None
+            rollout_tensor = None
+            revise_tensor = None
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "pearl"
+                and spec_decode_metadata is not None
+            ):
+                # PEARL DP/PP coordination: sync sampler outputs across PP.
+                (
+                    sampler_output,
+                    pearl_verify_result,
+                    acc_tensor,
+                    rollout_tensor,
+                    revise_tensor,
+                ) = self._sample_pearl(
+                    scheduler_output, logits, spec_decode_metadata
+                )
+                (
+                    sampler_output,
+                    acc_tensor,
+                    rollout_tensor,
+                    revise_tensor,
+                ) = self._pearl_sync_pp_sampler_output(
+                    sampler_output,
+                    acc_tensor,
+                    rollout_tensor,
+                    revise_tensor,
+                )
+            else:
+                sampler_output = self._sample(logits, spec_decode_metadata)
 
         self.input_batch.prev_sampled_token_ids = None
 
@@ -3288,7 +5028,115 @@ class GPUModelRunner(
             )
 
         if (
+            self.use_async_scheduling
+            and self.speculative_config
+            and self.speculative_config.method == "pearl"
+            and spec_decode_metadata is not None
+        ):
+            sampled_tensor = self._pearl_sync_output_tensor(
+                scheduler_output, sampler_output.sampled_token_ids
+            )
+            if sampled_tensor is not None:
+                valid_sampled_token_ids, _ = RejectionSampler.parse_output(
+                    sampled_tensor,
+                    self.input_batch.vocab_size,
+                    invalid_req_indices,
+                )
+            self.input_batch.prev_sampled_token_ids = None
+            self.input_batch.prev_req_id_to_index = None
+            self._pearl_apply_sampled_tokens(
+                req_ids_output_copy, valid_sampled_token_ids
+            )
+
+        if (
             self.speculative_config
+            and self.speculative_config.method == "pearl"
+            and not self.pearl_in_draft
+        ):
+            if not self.use_async_scheduling:
+                sampled_tensor = self._pearl_sync_output_tensor(
+                    scheduler_output, sampler_output.sampled_token_ids
+                )
+                if sampled_tensor is not None:
+                    valid_sampled_token_ids, _ = RejectionSampler.parse_output(
+                        sampled_tensor,
+                        self.input_batch.vocab_size,
+                        invalid_req_indices,
+                    )
+            if pearl_verify_result is None:
+                pearl_verify_result = self._pearl_build_verify_result(
+                    scheduler_output,
+                    req_ids_output_copy,
+                    valid_sampled_token_ids,
+                )
+                acc_list = []
+                rollout_list = []
+                revise_list = []
+                for req_id in req_ids_output_copy:
+                    res = pearl_verify_result.get(
+                        req_id,
+                        {"acc": True, "rollout": 0, "revise": -1, "finish": False},
+                    )
+                    acc_list.append(1 if res["acc"] else 0)
+                    rollout_list.append(int(res["rollout"]))
+                    revise_list.append(int(res["revise"]))
+                acc_tensor = torch.tensor(
+                    acc_list, device=self.device, dtype=torch.int32
+                )
+                rollout_tensor = torch.tensor(
+                    rollout_list, device=self.device, dtype=torch.int32
+                )
+                revise_tensor = torch.tensor(
+                    revise_list, device=self.device, dtype=torch.int32
+                )
+            assert acc_tensor is not None
+            assert rollout_tensor is not None
+            assert revise_tensor is not None
+            acc_tensor, rollout_tensor, revise_tensor = (
+                self._pearl_sync_verification_tensors(
+                    acc_tensor, rollout_tensor, revise_tensor
+                )
+            )
+            pearl_verify_result = {
+                req_id: {
+                    "acc": bool(acc_tensor[i].item()),
+                    "rollout": int(rollout_tensor[i].item()),
+                    "revise": int(revise_tensor[i].item()),
+                    "finish": False,
+                }
+                for i, req_id in enumerate(req_ids_output_copy)
+            }
+            self.pearl_pending_verification = pearl_verify_result
+            self._pearl_apply_rollbacks_from_verify(
+                scheduler_output,
+                req_ids_output_copy,
+                [int(x) for x in rollout_tensor.tolist()],
+            )
+            self._pearl_update_pre_verify_from_result(
+                req_ids_output_copy,
+                [bool(x) for x in acc_tensor.tolist()],
+            )
+            logger.debug("PEARL sample: updated pre-verify state")
+            pending_proposals = self._pearl_take_pending_proposals()
+            self._pearl_take_pending_proposal_logprobs()
+            if pending_proposals is not None:
+                if pending_proposals or scheduler_output.total_num_scheduled_tokens == 0:
+                    self._draft_token_ids = [
+                        pending_proposals.get(req_id, [])
+                        for req_id in self.input_batch.req_ids
+                    ]
+                else:
+                    self._draft_token_ids = self._pearl_prepare_draft_token_ids(
+                        scheduler_output
+                    )
+            else:
+                self._draft_token_ids = self._pearl_prepare_draft_token_ids(
+                    scheduler_output
+                )
+
+        if (
+            self.speculative_config
+            and self.speculative_config.method != "pearl"
             and not use_padded_batch_for_eagle
             and input_fits_in_drafter
         ):
@@ -3299,6 +5147,12 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
+            pearl_verify_result = None
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "pearl"
+            ):
+                pearl_verify_result = self.pearl_pending_verification
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -3312,7 +5166,12 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                freed_block_ids=self.pearl_freed_block_ids or None,
+                pearl_verify_result=pearl_verify_result,
             )
+        # reset freed block collection after emitting.
+        self.pearl_freed_block_ids = []
+        self.pearl_pending_verification = None
 
         if not self.use_async_scheduling:
             return output
@@ -3409,6 +5268,9 @@ class GPUModelRunner(
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, SuffixDecodingProposer)
             draft_token_ids = self.drafter.propose(self.input_batch, sampled_token_ids)
+        elif spec_config.method == "pearl":
+            # PEARL uses a dedicated dual-model path; no draft tokens here.
+            draft_token_ids = [[] for _ in range(len(self.input_batch.req_ids))]
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, MedusaProposer)
@@ -3564,6 +5426,21 @@ class GPUModelRunner(
             self.model_config.model,
             scope="global",
         )
+        if self.pearl_groups is not None:
+            role = self.pearl_groups.role
+            role_name = "draft" if role.is_draft else "target"
+            role_world_size = (
+                len(role.draft_ranks)
+                if role.is_draft
+                else len(role.target_ranks)
+            )
+            logger.info(
+                "PEARL %s rank %d/%d loading model %s",
+                role_name,
+                role.local_rank,
+                role_world_size,
+                self.model_config.model,
+            )
         global_expert_loads, old_global_expert_indices_per_model, rank_mapping = (
             EplbState.get_eep_state(self.parallel_config)
             if eep_scale_up
@@ -3578,14 +5455,21 @@ class GPUModelRunner(
             with DeviceMemoryProfiler() as m:
                 time_before_load = time.perf_counter()
                 model_loader = get_model_loader(self.load_config)
-                self.model = model_loader.load_model(
-                    vllm_config=self.vllm_config, model_config=self.model_config
-                )
+                if self.pearl_tp_group is None:
+                    self.model = model_loader.load_model(
+                        vllm_config=self.vllm_config, model_config=self.model_config
+                    )
+                else:
+                    with patch_tensor_parallel_group(self.pearl_tp_group):
+                        self.model = model_loader.load_model(
+                            vllm_config=self.vllm_config,
+                            model_config=self.model_config,
+                        )
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
-                if hasattr(self, "drafter"):
+                if getattr(self, "drafter", None) is not None:
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)
                     if (
@@ -3643,6 +5527,55 @@ class GPUModelRunner(
                         aux_layers = self.model.get_eagle3_aux_hidden_state_layers()
 
                     self.model.set_aux_hidden_state_layers(aux_layers)
+                # PEARL draft model (dual-model) — load only when configured.
+                if (
+                    self.speculative_config
+                    and self.speculative_config.method == "pearl"
+                    and self.speculative_config.draft_model_config is not None
+                    and self.pearl_is_draft
+                    and self.model_config.model
+                    != self.speculative_config.draft_model_config.model
+                ):
+                    try:
+                        logger.info_once("Loading PEARL draft model...")
+                        draft_config = deepcopy(self.vllm_config)
+                        draft_config.model_config = (
+                            self.speculative_config.draft_model_config
+                        )
+                        if self.speculative_config.draft_parallel_config is not None:
+                            draft_config.parallel_config = (
+                                self.speculative_config.draft_parallel_config
+                            )
+                        draft_config.compilation_config.static_forward_context = {}
+                        if self.pearl_tp_group is None:
+                            self.pearl_draft_model = model_loader.load_model(
+                                vllm_config=draft_config,
+                                model_config=self.speculative_config.draft_model_config,
+                            )
+                        else:
+                            with patch_tensor_parallel_group(self.pearl_tp_group):
+                                self.pearl_draft_model = model_loader.load_model(
+                                    vllm_config=draft_config,
+                                    model_config=self.speculative_config.draft_model_config,
+                                )
+                        if self.pearl_tp_group is None:
+                            prepare_communication_buffer_for_model(
+                                self.pearl_draft_model
+                            )
+                        else:
+                            with patch_tensor_parallel_group(self.pearl_tp_group):
+                                prepare_communication_buffer_for_model(
+                                    self.pearl_draft_model
+                                )
+                    except torch.cuda.OutOfMemoryError as e:
+                        logger.error(
+                            "Failed to load PEARL draft model (OOM). Consider "
+                            "adjusting TP or gpu-memory-utilization. Error: %s",
+                            e,
+                        )
+                        raise
+                else:
+                    self.pearl_draft_model = None
                 time_after_load = time.perf_counter()
             self.model_memory_usage = m.consumed_memory
         except torch.cuda.OutOfMemoryError as e:
@@ -3662,7 +5595,20 @@ class GPUModelRunner(
             time_after_load - time_before_load,
             scope="local",
         )
-        prepare_communication_buffer_for_model(self.model)
+        if self.pearl_groups is not None:
+            role = self.pearl_groups.role
+            role_name = "draft" if role.is_draft else "target"
+            logger.info(
+                "PEARL %s finished loading model %s in %.2f seconds",
+                role_name,
+                self.model_config.model,
+                time_after_load - time_before_load,
+            )
+        if self.pearl_tp_group is None:
+            prepare_communication_buffer_for_model(self.model)
+        else:
+            with patch_tensor_parallel_group(self.pearl_tp_group):
+                prepare_communication_buffer_for_model(self.model)
         if (drafter := getattr(self, "drafter", None)) and (
             drafter_model := getattr(drafter, "model", None)
         ):
@@ -3695,30 +5641,44 @@ class GPUModelRunner(
             if self.eplb_state.is_async:
                 self.eplb_state.start_async_loop(rank_mapping=rank_mapping)
 
-        if (
-            self.vllm_config.compilation_config.mode
-            == CompilationMode.STOCK_TORCH_COMPILE
-            and supports_dynamo()
-        ):
-            backend = self.vllm_config.compilation_config.init_backend(self.vllm_config)
-            compilation_counter.stock_torch_compile_count += 1
-            self.model.compile(fullgraph=True, backend=backend)
-            return
-        # for other compilation modes, cudagraph behavior is controlled by
-        # CudagraphWraper and CudagraphDispatcher of vllm.
-
-        # wrap the model with full cudagraph wrapper if needed.
-        cudagraph_mode = self.compilation_config.cudagraph_mode
-        assert cudagraph_mode is not None
-        if cudagraph_mode.has_full_cudagraphs() and not self.parallel_config.enable_dbo:
-            self.model = CUDAGraphWrapper(
-                self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
-            )
-        elif self.parallel_config.enable_dbo:
-            if cudagraph_mode.has_full_cudagraphs():
-                self.model = UBatchWrapper(
-                    self.model, self.vllm_config, CUDAGraphMode.FULL, self.device
+        compile_context = (
+            patch_tensor_parallel_group(self.pearl_tp_group)
+            if self.pearl_tp_group is not None
+            else nullcontext()
+        )
+        with compile_context:
+            if (
+                self.vllm_config.compilation_config.mode
+                == CompilationMode.STOCK_TORCH_COMPILE
+                and supports_dynamo()
+            ):
+                backend = self.vllm_config.compilation_config.init_backend(
+                    self.vllm_config
                 )
+                compilation_counter.stock_torch_compile_count += 1
+                self.model.compile(fullgraph=True, backend=backend)
+                return
+            # for other compilation modes, cudagraph behavior is controlled by
+            # CudagraphWraper and CudagraphDispatcher of vllm.
+
+            # wrap the model with full cudagraph wrapper if needed.
+            cudagraph_mode = self.compilation_config.cudagraph_mode
+            assert cudagraph_mode is not None
+            if (
+                cudagraph_mode.has_full_cudagraphs()
+                and not self.parallel_config.enable_dbo
+            ):
+                self.model = CUDAGraphWrapper(
+                    self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
+                )
+            elif self.parallel_config.enable_dbo:
+                if cudagraph_mode.has_full_cudagraphs():
+                    self.model = UBatchWrapper(
+                        self.model,
+                        self.vllm_config,
+                        CUDAGraphMode.FULL,
+                        self.device,
+                    )
             else:
                 self.model = UBatchWrapper(
                     self.model, self.vllm_config, CUDAGraphMode.NONE, self.device

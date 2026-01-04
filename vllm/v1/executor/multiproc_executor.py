@@ -427,11 +427,18 @@ class MultiprocExecutor(Executor):
         # 16-23, PP rank 2
         # 24-31, PP rank 3
         # so world_size - tp_size = 32 - 8 = 24 should be PP rank = -1 (i.e. 3)
-        return (
+        base_rank = (
             self.world_size
             - self.parallel_config.tensor_parallel_size
             * self.parallel_config.prefill_context_parallel_size
         )
+        spec_cfg = getattr(self.vllm_config, "speculative_config", None)
+        if spec_cfg is not None and spec_cfg.method == "pearl":
+            draft_tp = spec_cfg.pearl_draft_tensor_parallel_size or 0
+            target_tp = spec_cfg.pearl_target_tensor_parallel_size or 0
+            if draft_tp > 0 and target_tp > 0:
+                return base_rank + draft_tp
+        return base_rank
 
 
 @dataclass

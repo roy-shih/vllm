@@ -341,6 +341,10 @@ class KVCacheManager:
         """
         self.block_pool.evict_blocks(block_ids)
 
+    def free_block_ids(self, block_ids) -> None:
+        """Free blocks by id (used by speculative rollback callbacks)."""
+        self.block_pool.free_blocks_by_id(block_ids)
+
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalidate prefix caching after the weights are updated,

@@ -4,6 +4,7 @@
 
 import gc
 import os
+from copy import deepcopy
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
 from typing import TYPE_CHECKING, Any, cast
@@ -16,6 +17,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.compilation import CompilationMode
+from vllm.config.utils import update_config
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -55,6 +57,11 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.v1.spec_decode.pearl_dist import (
+    PearlGroups,
+    compute_pearl_role,
+    init_pearl_groups,
+)
 
 logger = init_logger(__name__)
 
@@ -64,6 +71,48 @@ if TYPE_CHECKING:
 
 
 class Worker(WorkerBase):
+    def _build_pearl_runner_config(
+        self, pearl_groups: PearlGroups | None
+    ) -> VllmConfig:
+        spec_cfg = self.vllm_config.speculative_config
+        if (
+            spec_cfg is None
+            or spec_cfg.method != "pearl"
+            or pearl_groups is None
+        ):
+            return self.vllm_config
+
+        role = pearl_groups.role
+        runner_config = deepcopy(self.vllm_config)
+        runner_spec_cfg = runner_config.speculative_config
+        if runner_spec_cfg is None:
+            return self.vllm_config
+
+        if role.is_draft:
+            role_tp = runner_spec_cfg.pearl_draft_tensor_parallel_size or 1
+            if runner_spec_cfg.draft_model_config is None:
+                raise RuntimeError(
+                    "PEARL draft model config is missing on draft rank."
+                )
+            runner_config.model_config = runner_spec_cfg.draft_model_config
+        else:
+            role_tp = runner_spec_cfg.pearl_target_tensor_parallel_size
+            if role_tp is None:
+                if runner_spec_cfg.target_parallel_config is not None:
+                    role_tp = (
+                        runner_spec_cfg.target_parallel_config.tensor_parallel_size
+                    )
+                else:
+                    role_tp = runner_config.parallel_config.tensor_parallel_size
+            if runner_spec_cfg.target_model_config is not None:
+                runner_config.model_config = runner_spec_cfg.target_model_config
+
+        runner_config.parallel_config = update_config(
+            runner_config.parallel_config,
+            {"tensor_parallel_size": role_tp},
+        )
+        return runner_config
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -181,6 +230,46 @@ class Worker(WorkerBase):
         if isinstance(device, torch.device) and device.type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+            pearl_cfg = self.vllm_config.speculative_config
+            allow_oversub = bool(
+                pearl_cfg
+                and pearl_cfg.method == "pearl"
+                and pearl_cfg.pearl_allow_gpu_oversubscription
+            )
+            if (
+                pearl_cfg
+                and pearl_cfg.method == "pearl"
+                and (
+                    pearl_cfg.pearl_draft_kv_fraction is not None
+                    or pearl_cfg.pearl_target_kv_fraction is not None
+                )
+            ):
+                role = compute_pearl_role(
+                    self.rank,
+                    pearl_cfg.pearl_draft_tensor_parallel_size or 1,
+                    pearl_cfg.pearl_target_tensor_parallel_size
+                    or (
+                        self.parallel_config.world_size
+                        - (pearl_cfg.pearl_draft_tensor_parallel_size or 1)
+                    ),
+                )
+                kv_fraction = (
+                    pearl_cfg.pearl_draft_kv_fraction
+                    if role.is_draft
+                    else pearl_cfg.pearl_target_kv_fraction
+                )
+                if kv_fraction is not None:
+                    self.cache_config.gpu_memory_utilization *= kv_fraction
+                    if self.cache_config.kv_cache_memory_bytes is not None:
+                        self.cache_config.kv_cache_memory_bytes = int(
+                            self.cache_config.kv_cache_memory_bytes * kv_fraction
+                        )
+                    logger.info(
+                        "PEARL KV budget scaled by %.3f for %s role (rank=%d).",
+                        kv_fraction,
+                        "draft" if role.is_draft else "target",
+                        self.rank,
+                    )
             if (
                 self.parallel_config.data_parallel_size > 1
                 and self.parallel_config.data_parallel_size_local > 0
@@ -201,17 +290,22 @@ class Worker(WorkerBase):
 
                 # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
                 self.local_rank += dp_local_rank * tp_pp_world_size
-                assert self.local_rank < torch.cuda.device_count(), (
-                    f"DP adjusted local rank {self.local_rank} is out of bounds. "
-                )
                 visible_device_count = (
                     torch.cuda.device_count() if torch.cuda.is_available() else 0
                 )
-                assert self.parallel_config.local_world_size <= visible_device_count, (
-                    f"local_world_size ({self.parallel_config.local_world_size}) must "
-                    f"be less than or equal to the number of visible devices "
-                    f"({visible_device_count})."
-                )
+                if allow_oversub and visible_device_count > 0:
+                    self.local_rank = self.local_rank % visible_device_count
+                else:
+                    assert self.local_rank < visible_device_count, (
+                        f"DP adjusted local rank {self.local_rank} is out of bounds. "
+                    )
+                    assert (
+                        self.parallel_config.local_world_size <= visible_device_count
+                    ), (
+                        f"local_world_size ({self.parallel_config.local_world_size}) must "
+                        f"be less than or equal to the number of visible devices "
+                        f"({visible_device_count})."
+                    )
             self.device = torch.device(f"cuda:{self.local_rank}")
             current_platform.set_device(self.device)
 
@@ -275,7 +369,21 @@ class Worker(WorkerBase):
                 GPUModelRunner as GPUModelRunnerV1,
             )
 
-            self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+            pearl_groups: PearlGroups | None = None
+            runner_config = self.vllm_config
+            if (
+                self.vllm_config.speculative_config
+                and self.vllm_config.speculative_config.method == "pearl"
+            ):
+                try:
+                    pearl_groups = init_pearl_groups(self.vllm_config.speculative_config)
+                    runner_config = self._build_pearl_runner_config(pearl_groups)
+                except Exception as e:
+                    logger.warning("Failed to initialize PEARL groups in worker: %s", e)
+
+            self.model_runner = GPUModelRunnerV1(
+                runner_config, self.device, pearl_groups=pearl_groups
+            )
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -307,6 +415,20 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        if self.cache_config.skip_kv_cache_profiling:
+            kv_cache_memory_bytes = self.cache_config.kv_cache_memory_bytes
+            if kv_cache_memory_bytes is None:
+                raise ValueError(
+                    "skip_kv_cache_profiling requires kv_cache_memory_bytes "
+                    "to be set."
+                )
+            logger.info_once(
+                "Skipping KV cache memory profiling; using kv_cache_memory_bytes=%d.",
+                kv_cache_memory_bytes,
+                scope="local",
+            )
+            return int(kv_cache_memory_bytes)
+
         GiB = lambda b: b / GiB_bytes
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for

@@ -82,6 +82,8 @@ class CommonAttentionMetadata:
     slot_mapping: torch.Tensor
 
     causal: bool = True
+    # Optional per-token context lengths (e.g., speculative windows).
+    context_lens: torch.Tensor | None = None
 
     # Needed by FastPrefillAttentionBuilder
     logits_indices_padded: torch.Tensor | None = None
@@ -151,6 +153,11 @@ class CommonAttentionMetadata:
             block_table_tensor=self.block_table_tensor[:num_actual_reqs],
             slot_mapping=self.slot_mapping[:num_actual_tokens],
             causal=self.causal,
+            context_lens=(
+                self.context_lens[:num_actual_tokens]
+                if self.context_lens is not None
+                else None
+            ),
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,
             encoder_seq_lens=maybe_slice_reqs(self.encoder_seq_lens),

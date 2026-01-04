@@ -113,6 +113,9 @@ class Executor(ABC):
         underlying workers.
         """
         self.collective_rpc("initialize_from_config", args=(kv_cache_configs,))
+        if self.cache_config.skip_model_warmup:
+            logger.info("Skipping model warmup/compile per config.")
+            return
         self.collective_rpc("compile_or_warm_up_model")
 
     def register_failure_callback(self, callback: FailureCallback):  # noqa: B027

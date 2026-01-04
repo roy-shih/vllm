@@ -1,0 +1,72 @@
+# PEARL integration (work in progress)
+
+## Added
+- PEARL config surface (`SpeculativeConfig`): `method="pearl"` plus draft/target model + TP options, gamma/auto-gamma, block/batch caps, dynamic TP padding flag with validation.
+- Added PEARL draft/target EOS validation during config init (raises on mismatch).
+- Engine args: allow `method="pearl"` and auto-populate `pearl_target_model` from target when omitted; draft model remains required.
+- Added PEARL NCCL subgroup helper (`pearl_dist.py`) and GPU runner now initializes draft/target/verify groups when PEARL is selected.
+- Tests: `pytest tests/v1/spec_decode/test_pearl.py tests/v1/spec_decode/test_pearl_dist.py` (pass; upstream SWIG Deprecation warnings only).
+- Scheduler fixes: prompt length tracked at init (completion counts advance), block boundary allocation/preemption corrected, rollback updates cached counts.
+- Target verifier: removed double-append on accept; now only mutates on reject.
+- Tests (latest): `pytest tests/v1/spec_decode/test_pearl.py tests/v1/spec_decode/test_pearl_dist.py` (pass; upstream SWIG Deprecation warnings only).
+- Worker startup pre-creates PEARL groups and injects into GPUModelRunner; runner accepts optional groups (fallback to self-init).
+- KV helpers: BlockTable rollback hook, slot_mapping/context_lens utilities (`pearl_kv.py`), and unit tests (`test_pearl_kv.py`).
+- Added BlockTable rollback-to-num-tokens API and CUDA smoke test (`test_pearl_kv_gpu.py`) for slot_mapping after rollback.
+- Added PearlKVAdapter to map logical block tables into BlockTable rows and build slot mapping; unit tests updated.
+- Tests (latest): `pytest tests/v1/spec_decode/test_pearl.py tests/v1/spec_decode/test_pearl_dist.py tests/v1/spec_decode/test_pearl_kv.py tests/v1/spec_decode/test_pearl_kv_gpu.py` (pass; upstream SWIG Deprecation warnings only).
+- GPUModelRunner PEARL path now uses PearlKVAdapter for slot mapping; non-PEARL path unchanged. Added placeholder GPU smoke test (skipped).
+- PearlKVAdapter supports batch slot mapping; GPUModelRunner PEARL branch commits batch slot mapping; new unit test covers mixed rows.
+- GPUModelRunner now constructs a PearlKVAdapter when method is PEARL (wiring pending).
+- Draft-side helper (`vllm/v1/spec_decode/pearl.py`): `PearlDraftRunner`, `PearlSequenceState` for gamma-window greedy decode and verification payload packaging.
+- Logical scheduler/KV helpers (`pearl_scheduler.py`): block manager with hash-style reuse/rollback, prefill/decode scheduling, preemption hooks.
+- Target-side verifier stub (`pearl_target.py`): deterministic acceptance/rollback/finish logic for unit testing; exported via `vllm/v1/spec_decode/__init__.py`.
+- Target-side verifier now supports Bernoulli acceptance and rollback (`TargetVerifier.verify_and_update`) with sampling-based unit test.
+- Test warnings: added `tests/v1/spec_decode/conftest.py` to silence noisy SWIG Deprecation warnings for this suite.
+- Expanded SWIG Deprecation warning filters in `tests/v1/conftest.py` and `tests/v1/spec_decode/conftest.py` to suppress additional swig* wrappers.
+- Fixed batch slot-mapping unit expectation to accept tensor output and added importlib bootstrap warning filter.
+- Tests (latest): `pytest tests/v1/spec_decode/test_pearl.py tests/v1/spec_decode/test_pearl_dist.py tests/v1/spec_decode/test_pearl_kv.py tests/v1/spec_decode/test_pearl_kv_gpu.py` → 15 passed; upstream SWIG Deprecation warnings remain.
+- CommonAttentionMetadata now carries optional `context_lens`; PEARL path in GPUModelRunner sets it from PearlKVAdapter-built buffers (non-PEARL unchanged).
+- GPUModelRunner recognizes `method=\"pearl\"` and skips legacy single-drafter wiring (placeholder for upcoming dual-model loop).
+- Tests (user repeat): `pytest tests/v1/spec_decode/test_pearl.py tests/v1/spec_decode/test_pearl_dist.py tests/v1/spec_decode/test_pearl_kv.py tests/v1/spec_decode/test_pearl_kv_gpu.py` → 15 passed; upstream SWIG Deprecation warnings remain.
+- Added PEARL execute-model wrapper: `_execute_model_pearl` (currently target-only passthrough with subgroup barrier) dispatches to refactored `_execute_model_body` for future dual-model integration.
+- PEARL scaffolding: store `pearl_is_draft`, optionally load a dedicated draft model in `load_model`, and allow overriding the forward model via `_model_forward(model_override=...)` to support upcoming dual-model loop.
+- Added context_lens shape assertion in PEARL slot_mapping path and a CUDA smoke test (`tests/v1/spec_decode/test_pearl_smoke_gpu.py`) to ensure context_lens flows through CommonAttentionMetadata on GPU.
+- Fixed `BlockTable.build_slot_mapping` local numpy shadowing (UnboundLocalError) exposed by the CUDA smoke test.
+- PEARL execute path now broadcasts placeholder proposals across verify subgroup, augments scheduler output with speculative tokens, and reuses the standard target path with updated token counts (non-PEARL unaffected).
+- `_execute_model_pearl` now runs a real draft forward pass (uses the draft model if provided), snapshots KV/block/token state, rolls back after collecting proposals, and broadcasts the proposals before the target pass.
+- Smoke/test command updated to use venv-local pytest binary.
+- BlockTable/MultiGroupBlockTable now support an optional free-block callback invoked on rollback, enabling callers to return trailing pages to a KV allocator.
+- GPUModelRunner wires the new free-block callback and collects freed block ids (pending scheduler hookup for real release).
+- Added scheduler-side handling for freed block ids: ModelRunnerOutput now carries `freed_block_ids`, scheduler forwards to KVCacheManager.free_block_ids, and BlockPool exposes `free_blocks_by_id` to actually return pages.
+- PEARL sampler: added `PearlRejectionSampler` to implement PEARL-style accept/reject on target logits with optional bonus token.
+- GPUModelRunner PEARL flow now drafts `gamma` tokens via repeated draft forward+sample, rolls back block tables based on rejected draft tokens, and broadcasts output tokens across the verify subgroup.
+- MultiGroupBlockTable now exposes `rollback_row_to_num_tokens` to propagate token-based rollback across block tables.
+- Tests: added `test_pearl_rejection_sampler_greedy_accepts_all` in `tests/v1/sample/test_rejection_sampler.py`.
+- PEARL now builds `draft_model_config`/`draft_parallel_config` for draft model loading, skips legacy `propose_draft_token_ids`, and records freed block id 0 correctly.
+- Tests (user-run): `pytest tests/v1/spec_decode/test_pearl.py tests/v1/spec_decode/test_pearl_dist.py tests/v1/spec_decode/test_pearl_kv.py tests/v1/spec_decode/test_pearl_kv_gpu.py tests/v1/spec_decode/test_pearl_smoke_gpu.py` → 16 passed (SWIG Deprecation warnings only).
+- Tests (user-run): `pytest tests/v1/sample/test_rejection_sampler.py -k pearl_rejection_sampler` → 1 passed (SWIG Deprecation warnings only).
+- Tests not run for this update: `pytest tests/v1/spec_decode/test_pearl.py tests/v1/spec_decode/test_pearl_dist.py tests/v1/spec_decode/test_pearl_kv.py tests/v1/spec_decode/test_pearl_kv_gpu.py tests/v1/spec_decode/test_pearl_smoke_gpu.py`.
+- Tests (`tests/v1/spec_decode/test_pearl.py`) covering draft runner, scheduler behavior, and target verification.
+- README.pearl.md: live design/TODO log.
+- PEARL pre-verify state now threads through SpecDecodeMetadata into PearlRejectionSampler (pre-verify accepts/rejects the full draft window without bonus tokens). GPUModelRunner updates pre-verify state after sampling, proposes next draft tokens via the draft helper, and adjusts rollback math for PEARL’s no-bonus outputs.
+- GPUModelRunner now splits PEARL draft/target roles: draft ranks generate proposals and broadcast via the verify subgroup, target ranks consume pending proposals, and draft-forward logits respect `model_override`.
+- PEARL draft ranks now synchronize target-sampled tokens via verify/draft broadcast, apply them to local input_batch state, and run rollback bookkeeping to keep draft state aligned.
+- PEARL async scheduling now syncs sampled tokens via GPU tensor broadcast for correctness, and PEARL draft/target roles use role-specific TP groups with a TP>1 guard to prevent deadlocks.
+- Scheduler now uses PEARL verify results (acc/rollout/revise) for rollback accounting, and spec decode logging includes MAT.
+- Local PEARL smoke fixes (Qwen3 draft+target, TP=1/1): MultiGroupBlockTable had no `block_size/slot_mapping/num_blocks_per_row` so PEARL draft path now adapts the first group BlockTable via PearlKVAdapter, and MultiGroupBlockTable exposes snapshot/rollback helpers used by GPUModelRunner (prevents AttributeError in draft collection and rollback).
+- Local PEARL smoke fixes: draft-side `drafter.load_model()` was called when drafter is None in PEARL dual-model flow, so we guard the call to avoid `NoneType` failures.
+- Local PEARL smoke fixes: duplicate layer-name errors during PEARL draft model load were resolved by deep-copying vllm_config, swapping in draft model/parallel configs, clearing `compilation_config.static_forward_context`, and loading draft weights only on draft ranks under `patch_tensor_parallel_group`.
+- Local PEARL smoke fixes: draft snapshot used `.clone()`/`.zero_()` on numpy token buffers; now uses `.copy()`/`.fill(0)` so PEARL token rollback works with `token_ids_cpu` numpy views.
+- Local PEARL smoke fixes: PEARL draft loop was re-running `_update_states` each gamma step, causing req_id/index shape mismatches. Draft forward now skips `_update_states` and relies on explicit rollback snapshots.
+- Local PEARL smoke fixes: CUDA graph capture threw "capturing detected at an inappropriate time" during draft-forward. Draft passes now force eager execution (cudagraph_mode=NONE) to avoid illegal capture in PEARL draft loop.
+- PEARL grouping fix: workers now build role-specific model-runner configs so draft ranks load the draft model with draft TP while target ranks load the target model with target TP. Target forward runs only on target ranks under the target TP group, and communication buffers are prepared under the role TP group to keep collectives consistent.
+- PEARL compile/cudagraph init now runs under the role-specific TP group so draft/target compilation does not block on mismatched collectives.
+- Load progress can be forced on all ranks with `VLLM_TQDM_ALL_RANKS=1`, useful for PEARL target ranks where shard progress is otherwise hidden.
+- PEARL now logs per-role completion after model load so target completion isn’t hidden by `info_once`.
+- Default model loader now logs when it starts applying weights to the model to clarify the post-shard load step.
+- Default model loader now logs per-rank apply/finish timings so target-rank load completion is visible in PEARL runs.
+
+## Testing
+- `pytest tests/v1/spec_decode/test_pearl.py` (CPU simulation; passes with minor Deprecation warnings).
+- `python -m compileall` on updated modules.
+- Latest: `./.venv/bin/pytest tests/v1/spec_decode/test_pearl.py tests/v1/spec_decode/test_pearl_dist.py tests/v1/spec_decode/test_pearl_kv.py tests/v1/spec_decode/test_pearl_kv_gpu.py tests/v1/spec_decode/test_pearl_smoke_gpu.py` → 13 passed, 3 skipped (CUDA unavailable); warnings: NVML init failure on CPU-only run plus SWIG Deprecation notices.

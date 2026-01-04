@@ -68,6 +68,7 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
+        self.speculative_config = vllm_config.speculative_config
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -1049,6 +1050,13 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
+        # PEARL rollback may provide freed block ids; free them early.
+        if model_runner_output.freed_block_ids:
+            try:
+                self.kv_cache_manager.free_block_ids(model_runner_output.freed_block_ids)
+            except Exception:
+                logger.debug("Ignoring freed_block_ids on scheduler free failure", exc_info=True)
+
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
         kv_connector_stats: KVConnectorStats | None = (
@@ -1095,7 +1103,18 @@ class Scheduler(SchedulerInterface):
             )
             if scheduled_spec_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
+                if (
+                    self.speculative_config is not None
+                    and self.speculative_config.method == "pearl"
+                    and model_runner_output.pearl_verify_result is not None
+                    and req_id in model_runner_output.pearl_verify_result
+                ):
+                    rollout = int(
+                        model_runner_output.pearl_verify_result[req_id]["rollout"]
+                    )
+                    num_accepted = max(num_draft_tokens - rollout, 0)
+                else:
+                    num_accepted = len(generated_token_ids) - 1
                 num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled

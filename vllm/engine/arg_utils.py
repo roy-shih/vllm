@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import os
 import copy
 import dataclasses
 import functools
@@ -434,6 +435,8 @@ class EngineArgs:
     cpu_offload_gb: float = CacheConfig.cpu_offload_gb
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
+    skip_kv_cache_profiling: bool = CacheConfig.skip_kv_cache_profiling
+    skip_model_warmup: bool = CacheConfig.skip_model_warmup
     max_num_batched_tokens: int | None = None
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
@@ -889,6 +892,12 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
+        cache_group.add_argument(
+            "--skip-kv-cache-profiling", **cache_kwargs["skip_kv_cache_profiling"]
+        )
+        cache_group.add_argument(
+            "--skip-model-warmup", **cache_kwargs["skip_model_warmup"]
+        )
         cache_group.add_argument("--swap-space", **cache_kwargs["swap_space"])
         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
         cache_group.add_argument(
@@ -1297,7 +1306,16 @@ class EngineArgs:
                 "target_parallel_config": target_parallel_config,
             }
         )
-        return SpeculativeConfig(**self.speculative_config)
+        spec_cfg = SpeculativeConfig(**self.speculative_config)
+        # For PEARL, ensure draft/target models are populated even if omitted.
+        if spec_cfg.method == "pearl":
+            if spec_cfg.pearl_target_model is None:
+                spec_cfg.pearl_target_model = target_model_config.model
+            if spec_cfg.pearl_draft_model is None:
+                raise ValueError(
+                    "pearl_draft_model must be provided when using method='pearl'."
+                )
+        return spec_cfg
 
     def create_engine_config(
         self,
@@ -1312,6 +1330,14 @@ class EngineArgs:
         current_platform.pre_register_and_update()
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
+        if isinstance(self.speculative_config, dict):
+            if (
+                self.speculative_config.get("method") == "pearl"
+                and self.speculative_config.get(
+                    "pearl_allow_gpu_oversubscription", False
+                )
+            ):
+                os.environ["VLLM_ALLOW_GPU_OVERSUBSCRIPTION"] = "1"
 
         # Check if the model is a speculator and override model/tokenizer/config
         # BEFORE creating ModelConfig, so the config is created with the target model
@@ -1328,6 +1354,10 @@ class EngineArgs:
                     vllm_speculative_config=self.speculative_config,
                 )
             )
+
+        speculative_config_input = None
+        if isinstance(self.speculative_config, dict):
+            speculative_config_input = dict(self.speculative_config)
 
         model_config = self.create_model_config()
         self.model = model_config.model
@@ -1360,6 +1390,8 @@ class EngineArgs:
             block_size=self.block_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
+            skip_kv_cache_profiling=self.skip_kv_cache_profiling,
+            skip_model_warmup=self.skip_model_warmup,
             swap_space=self.swap_space,
             cache_dtype=self.kv_cache_dtype,
             is_attention_free=model_config.is_attention_free,
@@ -1602,6 +1634,22 @@ class EngineArgs:
             stream_interval=self.stream_interval,
         )
 
+        if speculative_config is not None and speculative_config.method == "pearl":
+            spec_input = speculative_config_input or {}
+            if "pearl_block_size" in spec_input:
+                cache_config.block_size = int(speculative_config.pearl_block_size)
+            if "pearl_max_num_seqs" in spec_input:
+                scheduler_config.max_num_seqs = int(
+                    speculative_config.pearl_max_num_seqs
+                )
+            if "pearl_max_num_batched_tokens" in spec_input:
+                scheduler_config.max_num_batched_tokens = int(
+                    speculative_config.pearl_max_num_batched_tokens
+                )
+            if not cache_config.enable_prefix_caching:
+                cache_config.enable_prefix_caching = True
+                logger.info("PEARL enabled prefix caching by default.")
+
         if not model_config.is_multimodal_model and self.default_mm_loras:
             raise ValueError(
                 "Default modality-specific LoRA(s) were provided for a "
@@ -1739,6 +1787,10 @@ class EngineArgs:
                 method = self.speculative_config.get("method", None)
             else:
                 method = self.speculative_config.method
+
+            if method == "pearl":
+                # PEARL is allowed; detailed validation is handled by SpeculativeConfig.
+                pass
 
             if method == "draft_model":
                 raise NotImplementedError(

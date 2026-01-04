@@ -14,6 +14,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.pearl_sampler import PearlRejectionSampler
 
 DEVICE = current_platform.device_type
 
@@ -776,6 +777,50 @@ def test_allowed_token_ids(rejection_sampler):
     expected = torch.tensor(
         [[15, -1, -1, -1], [10, 5, 10, -1], [7, 10, 12, 5]],
         dtype=torch.int,
+        device=logits.device,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
+def test_pearl_rejection_sampler_greedy_accepts_all():
+    mock_sampler = Mock(spec=Sampler)
+    mock_sampler.logprobs_mode = "raw_logprobs"
+    bonus_token_ids = torch.tensor([[9], [8]], device=DEVICE, dtype=torch.int32)
+    mock_sampler.return_value = SamplerOutput(
+        sampled_token_ids=bonus_token_ids, logprobs_tensors=None
+    )
+    pearl_sampler = PearlRejectionSampler(mock_sampler)
+
+    spec_tokens = [[1, 2], [3]]
+    vocab_size = 10
+    num_draft = sum(len(tokens) for tokens in spec_tokens)
+    logits = torch.full(
+        (num_draft + len(spec_tokens), vocab_size),
+        -5.0,
+        device=DEVICE,
+    )
+    for i, tok in enumerate([1, 2, 3]):
+        logits[i, tok] = 5.0
+
+    spec_decode_metadata = SpecDecodeMetadata.make_dummy(spec_tokens, device=logits.device)
+    spec_decode_metadata.target_logits_indices = torch.arange(
+        num_draft, device=logits.device
+    )
+    spec_decode_metadata.bonus_logits_indices = torch.arange(
+        num_draft, num_draft + len(spec_tokens), device=logits.device
+    )
+
+    metadata = create_sampling_metadata(all_greedy=True)
+    output = pearl_sampler(
+        spec_decode_metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=metadata,
+    )
+
+    expected = torch.tensor(
+        [[1, 2, 9], [3, 8, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
         device=logits.device,
     )
     assert torch.equal(output.sampled_token_ids, expected)

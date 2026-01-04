@@ -72,6 +72,10 @@ class BlockTable:
         self.slot_mapping = self._make_buffer(
             self.max_num_batched_tokens, dtype=torch.int64
         )
+        # Optional callback invoked with a list of removed block ids when a row
+        # rolls back and drops trailing blocks. This allows callers to free
+        # underlying allocator pages.
+        self.free_block_callback = None
 
         if self.use_hybrid_blocks:
             self._kernel_block_arange = np.arange(0, self.blocks_per_kv_block).reshape(
@@ -123,6 +127,84 @@ class BlockTable:
         block_table_np = self.block_table.np
         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
+
+    def rollback_row_to_num_blocks(self, row_idx: int, num_blocks: int) -> None:
+        """Reduce the number of blocks tracked for a request row.
+
+        This is useful for speculative rollback where the logical sequence
+        shrinks and trailing KV blocks should no longer be referenced.
+        """
+        prev = int(self.num_blocks_per_row[row_idx])
+        num_blocks = max(0, min(num_blocks, prev))
+        if num_blocks < prev and self.free_block_callback is not None:
+            removed = self.block_table.np[row_idx, num_blocks:prev].tolist()
+            try:
+                self.free_block_callback(removed)
+            except Exception:
+                # Best-effort; keep rollback progressing even if free fails.
+                pass
+        self.num_blocks_per_row[row_idx] = num_blocks
+        # Zero out trailing entries for clarity.
+        self.block_table.cpu[row_idx, num_blocks :] = 0
+        if self.block_table.gpu is not None:
+            self.block_table.gpu[row_idx, num_blocks :] = 0
+
+    def rollback_row_to_num_tokens(self, row_idx: int, num_tokens: int) -> None:
+        """Rollback tracking for a row to the number of tokens (ceil to blocks)."""
+        new_num_blocks = cdiv(num_tokens, self.block_size)
+        self.rollback_row_to_num_blocks(row_idx, new_num_blocks)
+
+    def build_slot_mapping(
+        self, req_indices: np.ndarray, positions: np.ndarray
+    ) -> torch.Tensor:
+        """Return a slot_mapping tensor without mutating caller state.
+
+        Mirrors compute_slot_mapping logic but returns a tensor directly
+        (CPU). This is useful for PEARL/control-flow paths that need a
+        slot mapping view without committing buffers.
+        """
+        # Normalize inputs to numpy arrays for downstream arithmetic.
+        if isinstance(req_indices, torch.Tensor):
+            req_indices = req_indices.cpu().numpy()
+        else:
+            req_indices = np.asarray(req_indices, dtype=np.int64)
+        if isinstance(positions, torch.Tensor):
+            positions = positions.cpu().numpy()
+        else:
+            positions = np.asarray(positions, dtype=np.int64)
+        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        slot_mapping_out = np.zeros_like(positions, dtype=np.int64)
+        if total_cp_world_size > 1:
+            virtual_block_size = self.block_size * total_cp_world_size
+            block_table_indices = (
+                req_indices * self.max_num_blocks_per_req
+                + positions // virtual_block_size
+            )
+            block_numbers = self.block_table.np.ravel()[block_table_indices]
+            virtual_block_offsets = positions % virtual_block_size
+            mask = (
+                virtual_block_offsets
+                // self.cp_kv_cache_interleave_size
+                % total_cp_world_size
+                == total_cp_rank
+            )
+            block_offsets = (
+                virtual_block_offsets
+                // (total_cp_world_size * self.cp_kv_cache_interleave_size)
+                * self.cp_kv_cache_interleave_size
+                + virtual_block_offsets % self.cp_kv_cache_interleave_size
+            )
+            slot_mapping = block_numbers * self.block_size + block_offsets
+            slot_mapping_out[:] = np.where(mask, slot_mapping, -1)
+        else:
+            block_table_indices = (
+                req_indices * self.max_num_blocks_per_req + positions // self.block_size
+            )
+            block_numbers = self.block_table.np.ravel()[block_table_indices]
+            block_offsets = positions % self.block_size
+            np.add(block_numbers * self.block_size, block_offsets, out=slot_mapping_out)
+        return torch.from_numpy(slot_mapping_out)
 
     def swap_row(self, src: int, tgt: int) -> None:
         src_tgt, tgt_src = [src, tgt], [tgt, src]
@@ -337,6 +419,30 @@ class MultiGroupBlockTable:
     def clear(self) -> None:
         for block_table in self.block_tables:
             block_table.clear()
+
+    def set_free_block_callback(self, callback) -> None:
+        """Set a trailing-block free callback for all block tables."""
+        for block_table in self.block_tables:
+            block_table.free_block_callback = callback
+
+    def rollback_row_to_num_tokens(self, row_idx: int, num_tokens: int) -> None:
+        """Rollback all block tables for a row based on token count."""
+        for block_table in self.block_tables:
+            block_table.rollback_row_to_num_tokens(row_idx, num_tokens)
+
+    def get_num_blocks_per_row_snapshot(self) -> list[np.ndarray]:
+        """Return per-group num_blocks_per_row snapshots for rollback."""
+        return [table.num_blocks_per_row.copy() for table in self.block_tables]
+
+    def rollback_to_num_blocks_snapshot(self, snapshots: list[np.ndarray]) -> None:
+        """Rollback all block tables to a saved num_blocks_per_row snapshot."""
+        if len(snapshots) != len(self.block_tables):
+            raise ValueError(
+                "Snapshot length does not match number of KV cache groups."
+            )
+        for block_table, snapshot in zip(self.block_tables, snapshots):
+            for row_idx, num_blocks in enumerate(snapshot):
+                block_table.rollback_row_to_num_blocks(row_idx, int(num_blocks))
 
     def __getitem__(self, idx: int) -> "BlockTable":
         """Returns the BlockTable for the i-th KV cache group."""

@@ -397,6 +397,21 @@ class BlockPool:
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
 
+    def free_blocks_by_id(self, block_ids: Iterable[int]) -> None:
+        """Free blocks by block id (best-effort; ignores invalid/null ids)."""
+        blocks: list[KVCacheBlock] = []
+        for block_id in block_ids:
+            if block_id is None:
+                continue
+            if block_id < 0 or block_id >= len(self.blocks):
+                continue
+            block = self.blocks[block_id]
+            if block.is_null:
+                continue
+            blocks.append(block)
+        if blocks:
+            self.free_blocks(blocks)
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
 

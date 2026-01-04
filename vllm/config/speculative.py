@@ -10,7 +10,7 @@ from typing_extensions import Self
 
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
-from vllm.config.utils import config
+from vllm.config.utils import config, update_config
 from vllm.logger import init_logger
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
@@ -45,6 +45,7 @@ SpeculativeMethod = Literal[
     "mlp_speculator",
     "draft_model",
     "suffix",
+    "pearl",
     EagleModelTypes,
 ]
 
@@ -113,6 +114,38 @@ class SpeculativeConfig:
     speculative_token_tree: str | None = None
     """Specifies the tree structure for speculative token generation.
     """
+
+    # PEARL-specific parameters
+    pearl_draft_model: str | None = None
+    """Model identifier/path for the draft model when using PEARL."""
+    pearl_target_model: str | None = None
+    """Optional override of the target model for PEARL; defaults to the main
+    target model."""
+    pearl_draft_tensor_parallel_size: int | None = Field(default=None, ge=1)
+    """TP degree for the PEARL draft model. Defaults to 1 if unset."""
+    pearl_target_tensor_parallel_size: int | None = Field(default=None, ge=1)
+    """TP degree for the PEARL target model. Defaults to the main target TP if
+    unset."""
+    pearl_gamma: int = -1
+    """Window size for PEARL speculative decoding; -1 enables auto tuning."""
+    pearl_auto_gamma: bool = False
+    """If True, run a short profiling pass to auto set gamma."""
+    pearl_block_size: int = Field(default=256, ge=1)
+    """Logical KV block size used by PEARL KV layout."""
+    pearl_max_num_seqs: int = Field(default=512, ge=1)
+    """Maximum number of concurrent sequences in PEARL scheduler."""
+    pearl_max_num_batched_tokens: int = Field(default=16384, ge=1)
+    """Maximum batched tokens per PEARL step (prefill)."""
+    pearl_dynamic_tp_padding: bool = False
+    """Allow padding heads/intermediate/vocab for non-power-of-two TP in
+    PEARL."""
+    pearl_draft_kv_fraction: float | None = Field(default=None, gt=0.0, le=1.0)
+    """Fraction of KV cache budget reserved for draft role (per GPU)."""
+    pearl_target_kv_fraction: float | None = Field(default=None, gt=0.0, le=1.0)
+    """Fraction of KV cache budget reserved for target role (per GPU)."""
+    pearl_allow_gpu_oversubscription: bool = False
+    """Allow mapping multiple PEARL ranks onto the same GPU device."""
+
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the target model."""
@@ -246,6 +279,10 @@ class SpeculativeConfig:
                 "method `%s` is deprecated and replaced with mtp.", self.method
             )
             self.method = "mtp"
+
+        if self.method == "pearl":
+            self._init_pearl_config()
+            return self
 
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
@@ -639,6 +676,180 @@ class SpeculativeConfig:
 
     def __repr__(self) -> str:
         method = self.method
-        model = None if method in ("ngram", "suffix") else self.draft_model_config.model
+        if method in ("ngram", "suffix"):
+            model = None
+        elif method == "pearl":
+            model = self.pearl_draft_model
+        else:
+            model = self.draft_model_config.model
         num_spec_tokens = self.num_speculative_tokens
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"
+
+    def _init_pearl_config(self) -> None:
+        if self.pearl_draft_model is None:
+            raise ValueError(
+                "pearl_draft_model must be provided when method is set to 'pearl'."
+            )
+        if self.target_model_config is None:
+            raise ValueError(
+                "target_model_config must be provided when method is set to 'pearl'."
+            )
+        if self.pearl_target_model is None:
+            self.pearl_target_model = self.target_model_config.model
+        if self.pearl_target_model != self.target_model_config.model:
+            overrides: dict[str, Any] = {"model": self.pearl_target_model}
+            if self.target_model_config.tokenizer == self.target_model_config.model:
+                overrides["tokenizer"] = self.pearl_target_model
+            self.target_model_config = update_config(
+                self.target_model_config, overrides
+            )
+
+        if self.pearl_target_tensor_parallel_size is None:
+            self.pearl_target_tensor_parallel_size = (
+                self.target_parallel_config.tensor_parallel_size
+            )
+
+        if self.pearl_draft_tensor_parallel_size is None:
+            # Default draft TP to 1 unless explicitly provided.
+            self.pearl_draft_tensor_parallel_size = 1
+
+        if self.draft_model_config is None:
+            self.draft_model_config = ModelConfig(
+                model=self.pearl_draft_model,
+                runner="draft",
+                tokenizer=self.target_model_config.tokenizer,
+                tokenizer_mode=self.target_model_config.tokenizer_mode,
+                trust_remote_code=self.target_model_config.trust_remote_code,
+                allowed_local_media_path=self.target_model_config.allowed_local_media_path,
+                allowed_media_domains=self.target_model_config.allowed_media_domains,
+                dtype=self.target_model_config.dtype,
+                seed=self.target_model_config.seed,
+                revision=self.revision,
+                code_revision=self.code_revision,
+                tokenizer_revision=self.target_model_config.tokenizer_revision,
+                spec_target_max_model_len=self.target_model_config.max_model_len,
+                quantization=self.quantization,
+                enforce_eager=self.target_model_config.enforce_eager,
+                max_logprobs=self.target_model_config.max_logprobs,
+                hf_overrides=SpeculativeConfig.hf_config_override,
+                config_format=self.target_model_config.config_format,
+            )
+
+        if self.pearl_gamma < -1 or self.pearl_gamma == 0:
+            raise ValueError("pearl_gamma must be -1 (auto) or a positive integer.")
+
+        if (
+            self.target_model_config is not None
+            and self.target_model_config.max_model_len is not None
+            and self.pearl_max_num_batched_tokens
+            < self.target_model_config.max_model_len
+        ):
+            raise ValueError(
+                "pearl_max_num_batched_tokens must be >= target max_model_len "
+                f"({self.target_model_config.max_model_len})."
+            )
+
+        for tp in (
+            self.pearl_draft_tensor_parallel_size,
+            self.pearl_target_tensor_parallel_size,
+        ):
+            if tp is None:
+                continue
+            if not self._is_power_of_two(tp) and not self.pearl_dynamic_tp_padding:
+                raise ValueError(
+                    "Non-power-of-two tensor parallel sizes require "
+                    "pearl_dynamic_tp_padding=True."
+                )
+
+        if (
+            self.pearl_draft_kv_fraction is not None
+            or self.pearl_target_kv_fraction is not None
+        ):
+            draft_frac = self.pearl_draft_kv_fraction
+            target_frac = self.pearl_target_kv_fraction
+            if draft_frac is None:
+                draft_frac = 1.0 - float(target_frac)
+            if target_frac is None:
+                target_frac = 1.0 - float(draft_frac)
+            if draft_frac <= 0.0 or target_frac <= 0.0:
+                raise ValueError(
+                    "pearl_draft_kv_fraction and pearl_target_kv_fraction must be "
+                    "positive when specified."
+                )
+            if draft_frac + target_frac > 1.0:
+                raise ValueError(
+                    "pearl_draft_kv_fraction + pearl_target_kv_fraction must be <= 1."
+                )
+            self.pearl_draft_kv_fraction = float(draft_frac)
+            self.pearl_target_kv_fraction = float(target_frac)
+
+        self.draft_model_config.max_model_len = (
+            SpeculativeConfig._maybe_override_draft_max_model_len(
+                self.max_model_len,
+                self.draft_model_config.max_model_len,
+                self.target_model_config.max_model_len,
+            )
+        )
+
+        if self.draft_parallel_config is None:
+            self.draft_parallel_config = (
+                SpeculativeConfig.create_draft_parallel_config(
+                    self.target_parallel_config,
+                    self.pearl_draft_tensor_parallel_size,
+                )
+            )
+
+        # Ensure num_speculative_tokens is populated to satisfy downstream
+        # assumptions even though PEARL uses gamma instead.
+        if self.num_speculative_tokens is None:
+            if self.method == "pearl":
+                if self.pearl_gamma and self.pearl_gamma > 0:
+                    self.num_speculative_tokens = int(self.pearl_gamma)
+                else:
+                    # Provide a reasonable default so auto-gamma can pick >1.
+                    self.num_speculative_tokens = 8
+            else:
+                self.num_speculative_tokens = 1
+        if (
+            self.method == "pearl"
+            and self.pearl_gamma is not None
+            and self.pearl_gamma > 0
+            and self.num_speculative_tokens < self.pearl_gamma
+        ):
+            raise ValueError(
+                "num_speculative_tokens must be >= pearl_gamma for PEARL."
+            )
+
+        # Validate EOS consistency between draft and target.
+        # We only perform this check when target_model_config is available.
+        if self.target_model_config is not None:
+            target_eos = getattr(
+                self.target_model_config.hf_text_config, "eos_token_id", None
+            )
+            try:
+                from transformers import AutoConfig
+
+                draft_cfg = AutoConfig.from_pretrained(
+                    self.pearl_draft_model,
+                    trust_remote_code=self.target_model_config.trust_remote_code,
+                )
+                draft_eos = getattr(draft_cfg, "eos_token_id", None)
+                if draft_eos is not None and target_eos is not None:
+                    if draft_eos != target_eos:
+                        raise ValueError(
+                            f"PEARL requires draft/target EOS to match, but got "
+                            f"draft_eos={draft_eos} vs target_eos={target_eos}."
+                        )
+            except Exception as e:  # pragma: no cover - defensive, runtime validation
+                # Surface explicit mismatch errors; otherwise, let unexpected
+                # errors bubble up for visibility.
+                if isinstance(e, ValueError):
+                    raise
+                raise RuntimeError(
+                    "Failed to validate PEARL draft/target EOS consistency. "
+                    "Ensure draft/target models are accessible and share EOS."
+                ) from e
+
+    @staticmethod
+    def _is_power_of_two(x: int) -> bool:
+        return x > 0 and (x & (x - 1)) == 0

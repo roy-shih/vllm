@@ -147,6 +147,10 @@ class CacheConfig:
     control of how much memory gets used when compared with using
     gpu_memory_utilization. Note that kv_cache_memory_bytes
     (when not-None) ignores gpu_memory_utilization"""
+    skip_kv_cache_profiling: bool = False
+    """Skip KV cache memory profiling and warmup. Requires kv_cache_memory_bytes."""
+    skip_model_warmup: bool = False
+    """Skip model warmup/compile after KV cache initialization."""
 
     kv_offloading_size: float | None = None
     """Size of the KV cache offloading buffer in GiB. When TP > 1, this is
@@ -181,6 +185,8 @@ class CacheConfig:
             "prefix_caching_hash_algo",
             "cpu_kvcache_space_bytes",
             "mamba_page_size_padded",
+            "skip_kv_cache_profiling",
+            "skip_model_warmup",
             # Post-init/derived counters
             "num_gpu_blocks",
             "num_cpu_blocks",

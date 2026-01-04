@@ -561,13 +561,21 @@ class ParallelConfig:
                 and cuda_device_count_stateless() < self.world_size
             ):
                 gpu_count = cuda_device_count_stateless()
-                raise ValueError(
-                    f"World size ({self.world_size}) is larger than the number of "
-                    f"available GPUs ({gpu_count}) in this node. If this is "
-                    "intentional and you are using:\n"
-                    "- ray, set '--distributed-executor-backend ray'.\n"
-                    "- multiprocessing, set '--nnodes' appropriately."
-                )
+                if envs.VLLM_ALLOW_GPU_OVERSUBSCRIPTION:
+                    logger.warning(
+                        "World size (%d) exceeds visible GPUs (%d); "
+                        "oversubscribing GPUs due to VLLM_ALLOW_GPU_OVERSUBSCRIPTION.",
+                        self.world_size,
+                        gpu_count,
+                    )
+                else:
+                    raise ValueError(
+                        f"World size ({self.world_size}) is larger than the number of "
+                        f"available GPUs ({gpu_count}) in this node. If this is "
+                        "intentional and you are using:\n"
+                        "- ray, set '--distributed-executor-backend ray'.\n"
+                        "- multiprocessing, set '--nnodes' appropriately."
+                    )
             elif self.data_parallel_backend == "ray":
                 logger.info(
                     "Using ray distributed inference because "

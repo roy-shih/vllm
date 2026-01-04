@@ -74,6 +74,19 @@ class XPUWorker(Worker):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        if self.cache_config.skip_kv_cache_profiling:
+            kv_cache_memory_bytes = self.cache_config.kv_cache_memory_bytes
+            if kv_cache_memory_bytes is None:
+                raise ValueError(
+                    "skip_kv_cache_profiling requires kv_cache_memory_bytes "
+                    "to be set."
+                )
+            logger.info(
+                "Skipping KV cache memory profiling; using kv_cache_memory_bytes=%d.",
+                kv_cache_memory_bytes,
+            )
+            return int(kv_cache_memory_bytes)
+
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
         torch.xpu.empty_cache()

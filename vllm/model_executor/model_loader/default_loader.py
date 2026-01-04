@@ -302,6 +302,18 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.safetensors_load_strategy = "torchao"
 
         weights_to_load = {name for name, _ in model.named_parameters()}
+        if torch.distributed.is_initialized():
+            logger.info(
+                "Rank %d applying weights to model %s "
+                "(may take minutes for large models).",
+                torch.distributed.get_rank(),
+                model_config.model,
+            )
+        else:
+            logger.info(
+                "Applying weights to model %s (may take minutes for large models).",
+                model_config.model,
+            )
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
 
         self.counter_after_loading_weights = time.perf_counter()
@@ -310,6 +322,14 @@ class DefaultModelLoader(BaseModelLoader):
             self.counter_after_loading_weights - self.counter_before_loading_weights,
             scope="local",
         )
+        if torch.distributed.is_initialized():
+            logger.info(
+                "Rank %d finished loading weights for model %s in %.2f seconds",
+                torch.distributed.get_rank(),
+                model_config.model,
+                self.counter_after_loading_weights
+                - self.counter_before_loading_weights,
+            )
         # We only enable strict check for non-quantized models
         # that have loaded weights tracking currently.
         if model_config.quantization is None and loaded_weights is not None:

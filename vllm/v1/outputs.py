@@ -177,6 +177,12 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # Optional: freed block ids (used by PEARL rollback; scheduler may free).
+    freed_block_ids: list[int] | None = None
+
+    # Optional: PEARL verification results (per-request acc/rollout/revise).
+    pearl_verify_result: dict[str, dict[str, int | bool]] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
